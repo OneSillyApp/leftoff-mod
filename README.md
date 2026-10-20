@@ -1,7 +1,7 @@
 # Leftoff for Claude Code
 
 The Claude Code plugin behind [Leftoff](https://leftoff.dev) ("WTF was I working on?").
-Version 0.9.11.
+Version 0.9.12.
 
 It keeps track of every Claude Code session on your machine and writes a short
 checkpoint (what you were doing, where it stopped, what's next) when a session
