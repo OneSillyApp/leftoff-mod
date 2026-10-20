@@ -1,0 +1,25 @@
+{
+  "name": "leftoff",
+  "owner": {
+    "name": "One Silly App",
+    "email": "hello@leftoff.dev"
+  },
+  "metadata": {
+    "description": "Leftoff's Claude Code plugin: session tracking, checkpoints and /cp commands",
+    "version": "0.9.11-beta.15"
+  },
+  "plugins": [
+    {
+      "name": "leftoff",
+      "source": "./mod",
+      "description": "Session capture, /cp, /cp-name, /cp-park and the /leftoff pane",
+      "version": "0.9.11-beta.15",
+      "author": {
+        "name": "One Silly App"
+      },
+      "homepage": "https://leftoff.dev",
+      "repository": "https://github.com/OneSillyApp/leftoff-mod",
+      "license": "MIT"
+    }
+  ]
+}
