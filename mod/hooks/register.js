@@ -28,7 +28,7 @@ const END_TIMEOUT_MS = 1000
 const MODEL_TIMEOUT_MS = 20000
 
 // Module state. $.state is not used: the pane redraws with $.ui.invalidate.
-const MOD_VERSION = '0.9.13' // keep in step with .claude-plugin/plugin.json
+const MOD_VERSION = '0.9.14' // keep in step with .claude-plugin/plugin.json
 
 const st = {
   internal: false,

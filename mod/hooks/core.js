@@ -680,7 +680,7 @@ const SESSION_ORDER = ['id', 'title', 'title_source', 'machine', 'cwd', 'repo', 
 export const SESSION_EXTRA = ['inTurn', 'needsInput', 'backgroundTasks', 'turnsSinceCheckpoint', 'dormantStretch',
   'finalCheckpointDone', 'firstPrompt', 'lastPreview', 'lastNotification', 'lastEventAt', 'statusChanges', 'folder',
   'pid', 'tty', 'pidStartedAt', 'pidSource', 'term', 'closedAt', 'answers', 'lastNotificationMessage', 'needsInputAt', 'question', 'questionAt',
-  'startSource', 'historyTurns', 'healedAt', 'healedVia', 'archivedReason', 'backend', 'prLinks', 'prUnlinked', 'todos', 'files', 'startRepo', 'editedRepos', 'parked', 'nonInteractive', 'transcriptCwd', 'doubtedCheckpoints', 'liveLink', 'transcriptTurns', 'wasLive', 'headless', 'startedFrom', 'startProject', 'backgroundList']
+  'startSource', 'historyTurns', 'healedAt', 'healedVia', 'archivedReason', 'backend', 'prLinks', 'prUnlinked', 'todos', 'files', 'startRepo', 'editedRepos', 'parked', 'nonInteractive', 'transcriptCwd', 'doubtedCheckpoints', 'liveLink', 'transcriptTurns', 'wasLive', 'headless', 'startedFrom', 'startProject', 'backgroundList', 'doneAt']
 
 export const SESSION_FIELDS = ['id', 'title', 'titleSource', 'machine', 'cwd', 'repo', 'transcriptPath', 'model', 'surface', 'capture',
   'status', 'startedAt', 'lastActivityAt', 'lastHeartbeatAt', 'endedAt', 'endReason', 'turns', 'lastCheckpointId',
