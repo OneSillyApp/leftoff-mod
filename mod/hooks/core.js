@@ -494,6 +494,9 @@ export function renderCheckpointMd(cp) {
   // indented two spaces under their label (older readers take the first line).
   const field = cp.format === 'markdown' ? mdField : oneLine
   const lines = [
+    // 0.9.15: older readers skip a label they don't know
+    ...(cp.goal ? ['**Goal:** ' + oneLine(cp.goal)] : []),
+    ...(cp.progress ? ['**Progress:** ' + oneLine(cp.progress)] : []),
     '**Doing:** ' + field(cp.doing),
     '**Stopped at:** ' + field(cp.stoppedAt),
     '**Next:** ' + field(cp.next),
@@ -519,7 +522,7 @@ export function renderCheckpointMd(cp) {
 function oneLine(s) { return String(s == null ? '' : s).replace(/\s*\n\s*/g, ' ').trim() }
 function mdField(s) { return String(s == null ? '' : s).replace(/\r\n?/g, '\n').trim().split('\n').map((l, i) => (i ? '  ' + l.replace(/\s+$/, '') : l)).join('\n') }
 
-const BODY_FIELDS = { 'doing': 'doing', 'stopped at': 'stoppedAt', 'next': 'next', 'open question': 'openQuestion', 'note': 'userNote' }
+const BODY_FIELDS = { 'goal': 'goal', 'progress': 'progress', 'doing': 'doing', 'stopped at': 'stoppedAt', 'next': 'next', 'open question': 'openQuestion', 'note': 'userNote' }
 
 export function parseCheckpointMd(text) {
   const { data, body } = parseFrontmatter(text)
@@ -680,7 +683,7 @@ const SESSION_ORDER = ['id', 'title', 'title_source', 'machine', 'cwd', 'repo', 
 export const SESSION_EXTRA = ['inTurn', 'needsInput', 'backgroundTasks', 'turnsSinceCheckpoint', 'dormantStretch',
   'finalCheckpointDone', 'firstPrompt', 'lastPreview', 'lastNotification', 'lastEventAt', 'statusChanges', 'folder',
   'pid', 'tty', 'pidStartedAt', 'pidSource', 'term', 'closedAt', 'answers', 'lastNotificationMessage', 'needsInputAt', 'question', 'questionAt',
-  'startSource', 'historyTurns', 'healedAt', 'healedVia', 'archivedReason', 'backend', 'prLinks', 'prUnlinked', 'todos', 'files', 'startRepo', 'editedRepos', 'parked', 'nonInteractive', 'transcriptCwd', 'doubtedCheckpoints', 'liveLink', 'transcriptTurns', 'wasLive', 'headless', 'startedFrom', 'startProject', 'backgroundList', 'doneAt']
+  'startSource', 'historyTurns', 'healedAt', 'healedVia', 'archivedReason', 'backend', 'prLinks', 'prUnlinked', 'todos', 'files', 'startRepo', 'editedRepos', 'parked', 'nonInteractive', 'transcriptCwd', 'doubtedCheckpoints', 'liveLink', 'transcriptTurns', 'wasLive', 'headless', 'startedFrom', 'startProject', 'backgroundList', 'doneAt', 'recap']
 
 export const SESSION_FIELDS = ['id', 'title', 'titleSource', 'machine', 'cwd', 'repo', 'transcriptPath', 'model', 'surface', 'capture',
   'status', 'startedAt', 'lastActivityAt', 'lastHeartbeatAt', 'endedAt', 'endReason', 'turns', 'lastCheckpointId',
@@ -1009,6 +1012,7 @@ export function applyEvent(s, ev) {
       if (d.parentSessionId && d.parentSessionId !== s.id) s.parentSessionId = d.parentSessionId
       if (d.source === 'resume' || d.source === 'fork' || d.source === 'clear') { s.endedAt = null; s.endReason = null; s.closedAt = null }
       if (d.source === 'resume') s.startSource = 'resume' // a conversation that already had turns before Leftoff saw this process
+      if (d.source === 'clear' && s.parentSessionId) s.startSource = 'clear' // 0.9.15: the same tab after /clear (its goal may carry on)
       if (s.capture === 'mod') s.lastHeartbeatAt = at
       break
     case 'activity':
@@ -1370,13 +1374,20 @@ export function parseCheckpointArgs(args) {
   return { length, note: rest.join(' ') || null }
 }
 
+// 0.9.15: Goal and Progress first. Someone back after a weekend needs what the
+// session is FOR and how far along it is, not only its latest step; "Doing" alone
+// named the last small task ("committing the changelog") and Catch me up then read
+// that as the goal. The developer's own asks (askedFor) and the previous goal come
+// in with the prompt, so the goal survives a transcript too long to send whole.
 const CHECKPOINT_BASE = [
-  'You write checkpoints for a developer juggling many coding-agent sessions. Given the recent transcript of ONE session, start with exactly these three lines:',
+  'You write checkpoints for a developer juggling many coding-agent sessions, read when they come back after half an hour, a day or a weekend. Given the recent transcript of ONE session, start with exactly these five lines:',
+  'Goal: <the outcome the developer is after, from what they asked for, in a few plain words; not the latest step. Keep the previous goal unless they changed course or it is done and they moved on>',
+  'Progress: <one of Just started, Underway, Mostly done, Done, Stuck> - <what is left between here and the goal, a few words>',
   'Doing: <what the session was working on, one sentence, concrete nouns: files, features, errors>',
-  'Stopped at: <the exact state when it went quiet: what passed, what failed, what is half-done>',
+  'Stopped at: <the exact state when it went quiet: what passed, what failed, what is half-done; say what was actually run or checked, and what is only assumed>',
   'Next: <the single next action a human or the agent should take>',
   'If the session is blocked on the human (a question, a permission, a decision), start Next with "YOU:".',
-  'Describe only what the transcript shows; the lines above it (repo, branch, title, previous checkpoint) are background and may be out of date.',
+  'Describe only what the transcript shows; the lines above it (repo, branch, title, what was asked, previous checkpoint) are background and may be out of date.',
 ]
 const INFORMATIVE_SECTIONS = [
   'Then these sections, each a heading line followed by "- " bullets (write "- none" when there is nothing; never invent):',
@@ -1398,26 +1409,59 @@ const LONG_SECTIONS = [
   '3. <the step after that>',
 ]
 export const CHECKPOINT_SYSTEMS = {
-  short: [...CHECKPOINT_BASE, 'Write only those three lines.', 'Optionally a 4th line "Title: <max 6 words>" if asked for a title.', 'No preamble. No markdown. Under 60 words total.'].join('\n'),
-  informative: [...CHECKPOINT_BASE, ...INFORMATIVE_SECTIONS, 'Optionally a final line "Title: <max 6 words>" if asked for a title.', 'No preamble. No other markdown. Under 250 words total.'].join('\n'),
-  long: [...CHECKPOINT_BASE, ...INFORMATIVE_SECTIONS, ...LONG_SECTIONS, 'Optionally a final line "Title: <max 6 words>" if asked for a title.', 'No preamble. No other markdown. Under 600 words total.'].join('\n'),
+  short: [...CHECKPOINT_BASE, 'Write only those five lines.', 'Optionally a 6th line "Title: <max 6 words>" if asked for a title.', 'No preamble. No markdown. Under 90 words total.'].join('\n'),
+  informative: [...CHECKPOINT_BASE, ...INFORMATIVE_SECTIONS, 'Optionally a final line "Title: <max 6 words>" if asked for a title.', 'No preamble. No other markdown. Under 280 words total.'].join('\n'),
+  long: [...CHECKPOINT_BASE, ...INFORMATIVE_SECTIONS, ...LONG_SECTIONS, 'Optionally a final line "Title: <max 6 words>" if asked for a title.', 'No preamble. No other markdown. Under 630 words total.'].join('\n'),
 }
 // The short prompt, as before v0.4.6 (kept under its old name for anything importing it).
 export const CHECKPOINT_SYSTEM = CHECKPOINT_SYSTEMS.short
 
-export function buildCheckpointPrompt({ session, previous, messages, cfg = DEFAULT_CONFIG, wantTitle = false, userNote, length }) {
+// ---------------------------------------------------------------- what you asked for (0.9.15)
+//
+// The developer's own asks across the WHOLE transcript, not the window a
+// checkpoint sends: the first real one and the last course changes ("actually,
+// let's…"). Checkpoints and Catch me up (src/session-catchup.js) both read it.
+
+// Not something you typed: slash commands' output, hook text, Esc's marker.
+export const NOT_A_PROMPT = /^\s*(?:<(?:local-command-stdout|local-command-stderr|command-name|command-message|command-args|local-command-caveat|system-reminder|bash-input|bash-stdout|bash-stderr|user-prompt-submit-hook|task-notification|user-memory-input)\b|\[Request interrupted by user|Caveat: The messages below were generated)/
+// Too thin to be a goal on its own ("hi", "continue", "where were we").
+export const THIN_PROMPT = /^(?:hi|hey|hello|yo|ok(?:ay)?|yes|yep|y|no|go|go on|continue|keep going|carry on|thanks|thank you|ty|sure|do it|proceed|where were we|where did we leave off|what were we doing|pick up where (?:we|you) left off)\W*$/i
+// You changed course.
+export const PIVOT_RE = /^\s*(?:(?:ok(?:ay)?|hm+|wait|no|so|alright)[,.!]?\s+)?(?:actually\b|instead\b|scratch that|change of plans?\b|new plan\b|forget (?:that|it|about)\b|never ?mind\b|on second thought\b|let'?s (?:instead|switch|change|pivot|go back|try something else|do something else|not)\b|switch (?:to|gears)\b|pivot\b|rather than\b)/i
+
+// -> { asks, firstAsk, pivots, line } (line: the prompt's "first “…”, later “…”", or '')
+export function askedFor(messages, { firstPrompt = null } = {}) {
+  const asks = []
+  for (const m of messages || []) {
+    if (!m || m.role !== 'user' || m.compact || !m.text || !m.text.trim()) continue
+    const t = stripChannel(m.text).replace(/\s+/g, ' ').trim()
+    if (t && !NOT_A_PROMPT.test(t) && !THIN_PROMPT.test(t)) asks.push(t)
+  }
+  if (!asks.length && firstPrompt && !THIN_PROMPT.test(String(firstPrompt).trim())) asks.push(String(firstPrompt).replace(/\s+/g, ' ').trim())
+  const pivots = asks.slice(1).filter((t) => PIVOT_RE.test(t)).slice(-2)
+  const q = (t, n) => '“' + clip(t, n).replace(/[.!?]+$/, '') + '”'
+  const line = asks.length ? ['first ' + q(asks[0], 240), ...pivots.map((p) => 'later ' + q(p, 200))].join(', ') : ''
+  return { asks, firstAsk: asks[0] || null, pivots, line }
+}
+
+// parent (0.9.15): the latest checkpoint of the session this one was /clear'ed from, a hint for its goal.
+// uncommitted (0.9.15): the folder's uncommitted files (the daemon reads git; the mod doesn't), or null.
+export function buildCheckpointPrompt({ session, previous, messages, cfg = DEFAULT_CONFIG, wantTitle = false, userNote, length, parent = null, uncommitted = null }) {
   const len = summaryLength(cfg, length)
   const maxInputChars = (cfg.summarizer && cfg.summarizer.maxInputChars) || 24000
   const cwd = session.cwd
   const files = filesTouched(messages, cwd)
   const branch = session.repo && session.repo.branch
-  const prev = previous ? ['Doing: ' + previous.doing, 'Stopped at: ' + previous.stoppedAt, 'Next: ' + previous.next].join('\n') : 'none'
+  const prev = previous ? [...(previous.goal ? ['Goal: ' + previous.goal] : []), 'Doing: ' + previous.doing, 'Stopped at: ' + previous.stoppedAt, 'Next: ' + previous.next].join('\n') : 'none'
   const head = [
     'Repo: ' + repoName(session) + (branch ? ' (branch ' + branch + ')' : '') + ' · cwd ' + (cwd || '?'),
     'Title: ' + (session.title || '(none yet)'),
-    'Previous checkpoint: ' + prev,
-    'Files touched since then: ' + (files.length ? files.join(', ') : 'none'),
   ]
+  const asked = askedFor(messages, { firstPrompt: session.firstPrompt })
+  if (asked.line) head.push('What the developer asked for: ' + asked.line)
+  if (parent && (parent.goal || parent.doing)) head.push('Before /clear, this tab was working toward: ' + clip(parent.goal || parent.doing, 200) + (parent.progress ? ' (' + clip(parent.progress, 80) + ')' : '') + '. Keep that goal if the new requests continue it; otherwise write the new one.')
+  head.push('Previous checkpoint: ' + prev, 'Files touched since then: ' + (files.length ? files.join(', ') : 'none'))
+  if (Array.isArray(uncommitted)) head.push('Uncommitted files now: ' + (uncommitted.length ? uncommitted.slice(0, 12).join(', ') + (uncommitted.length > 12 ? ' and ' + (uncommitted.length - 12) + ' more' : '') : 'none (everything is committed)'))
   if (userNote) head.push('Note from the developer: ' + userNote)
   if (session.needsInput) head.push('State: the session is waiting on the developer (' + (session.lastNotification || 'a prompt') + ').')
   if (wantTitle) head.push('Also write the line: Title: <max 6 words>.')
@@ -1492,15 +1536,17 @@ function parseSections(lines) {
 }
 
 export function parseCheckpointReply(text) {
-  const out = { doing: '', stoppedAt: '', next: '', title: null, openQuestion: null, parseOk: true }
-  const map = { 'doing': 'doing', 'stopped at': 'stoppedAt', 'next': 'next', 'title': 'title', 'open question': 'openQuestion' }
+  const out = { doing: '', stoppedAt: '', next: '', title: null, openQuestion: null, parseOk: true } // goal, progress (0.9.15): only when written
+  const map = { 'goal': 'goal', 'progress': 'progress', 'doing': 'doing', 'stopped at': 'stoppedAt', 'next': 'next', 'title': 'title', 'open question': 'openQuestion' }
   const rest = []
   for (const raw of String(text || '').split('\n')) {
     const line = raw.replace(/^[\s*_#>-]+/, '').replace(/\*\*/g, '')
-    const m = line.match(/^(doing|stopped at|next|title|open question)\s*:\s*(.+)$/i)
+    const m = line.match(/^(goal|progress|doing|stopped at|next|title|open question)\s*:\s*(.+)$/i)
     if (m) out[map[m[1].toLowerCase()]] = m[2].trim()
     else rest.push(raw)
   }
+  if (out.goal) out.goal = clip(out.goal, 240)
+  if (out.progress) out.progress = clip(out.progress, 200)
   if (!out.doing || !out.stoppedAt || !out.next) {
     // 0.9.5: not the format asked for (a small model's markdown write-up): read what we can
     // from its headings and labels, keep the whole text (no 600-character cut), mark it.

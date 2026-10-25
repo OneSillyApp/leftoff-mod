@@ -28,7 +28,7 @@ const END_TIMEOUT_MS = 1000
 const MODEL_TIMEOUT_MS = 20000
 
 // Module state. $.state is not used: the pane redraws with $.ui.invalidate.
-const MOD_VERSION = '0.9.14' // keep in step with .claude-plugin/plugin.json
+const MOD_VERSION = '0.9.15' // keep in step with .claude-plugin/plugin.json
 
 const st = {
   internal: false,
@@ -47,6 +47,7 @@ const st = {
   paneNote: '',
   checkpointing: false,
   lastCheckpoint: null,
+  clearedFrom: null, // 0.9.15: the last checkpoint before a /clear in this process
   nameCommand: 'cp-name',
   commands: null,
   modHealthSent: false,
@@ -705,7 +706,7 @@ async function makeCheckpoint($, trigger, userNote, length, opts = {}) {
     const record = { ...(st.record || {}), id: st.sessionId }
     let messages = []
     try { messages = await $.session.messages() } catch {}
-    const ctx = buildCheckpointPrompt({ session: record, previous: st.lastCheckpoint, messages, cfg: st.cfg, userNote, length })
+    const ctx = buildCheckpointPrompt({ session: record, previous: st.lastCheckpoint, messages, cfg: st.cfg, userNote, length, parent: st.lastCheckpoint ? null : st.clearedFrom || null })
     const reply = await callModel($, ctx)
     let parsed = reply ? parseCheckpointReply(reply.text) : null
     let generator = reply ? { by: 'mod', model: reply.model, ...(reply.backend ? { backend: reply.backend } : {}) } : null
@@ -730,6 +731,7 @@ async function makeCheckpoint($, trigger, userNote, length, opts = {}) {
     const cp = {
       sessionId: st.sessionId, createdAt: nowIso(), trigger, machine: st.machine,
       sessionTitle: record.title || null, repo: record.repo ? repoName(record) : null, branch: (record.repo && record.repo.branch) || null, cwd: record.cwd || null,
+      ...(parsed.goal ? { goal: parsed.goal } : {}), ...(parsed.progress ? { progress: parsed.progress } : {}), // 0.9.15
       doing: parsed.doing, stoppedAt: parsed.stoppedAt, next: parsed.next, openQuestion: parsed.openQuestion || null,
       userNote: userNote || null, filesTouched: ctx.filesTouched, turnsSinceLast: record.turnsSinceCheckpoint || 0,
       parseOk: parsed.parseOk, ...(parsed.format === 'markdown' ? { format: 'markdown' } : {}), generator, length: ctx.length,
@@ -1042,6 +1044,7 @@ export function register(on, options) {
         parentSessionId = st.sessionId
         st.sessionId = e.session_id
         st.record = { ...(st.record || {}), id: e.session_id, turns: 0, turnsSinceCheckpoint: 0, endedAt: null, title: null, titleSource: null, startedAt: null }
+        st.clearedFrom = e.source === 'clear' ? st.lastCheckpoint : null // 0.9.15: a hint for the new session's goal
         st.lastCheckpoint = null
         st.titleSoon = false
         st.daemonTitle = null
