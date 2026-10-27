@@ -1,6 +1,6 @@
 {
   "name": "leftoff",
-  "version": "0.9.15",
+  "version": "0.9.16",
   "description": "Leftoff (formerly Checkpoints): WTF was I working on? Tracks every Claude Code session on this machine, writes a 3-line checkpoint when one goes quiet, and adds /cp (checkpoint now), /cp-name and a /leftoff pane. Talks to the local Leftoff daemon on 127.0.0.1:7429 and falls back to writing markdown in ~/checkpoints.",
   "author": {
     "name": "One Silly App"

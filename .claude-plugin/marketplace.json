@@ -6,14 +6,14 @@
   },
   "metadata": {
     "description": "Leftoff's Claude Code plugin: session tracking, checkpoints and /cp commands",
-    "version": "0.9.15"
+    "version": "0.9.16"
   },
   "plugins": [
     {
       "name": "leftoff",
       "source": "./mod",
       "description": "Session capture, /cp, /cp-name, /cp-park and the /leftoff pane",
-      "version": "0.9.15",
+      "version": "0.9.16",
       "author": {
         "name": "One Silly App"
       },
