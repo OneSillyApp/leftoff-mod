@@ -683,7 +683,7 @@ const SESSION_ORDER = ['id', 'title', 'title_source', 'machine', 'cwd', 'repo', 
 export const SESSION_EXTRA = ['inTurn', 'needsInput', 'backgroundTasks', 'turnsSinceCheckpoint', 'dormantStretch',
   'finalCheckpointDone', 'firstPrompt', 'lastPreview', 'lastNotification', 'lastEventAt', 'statusChanges', 'folder',
   'pid', 'tty', 'pidStartedAt', 'pidSource', 'term', 'closedAt', 'answers', 'lastNotificationMessage', 'needsInputAt', 'question', 'questionAt',
-  'startSource', 'historyTurns', 'healedAt', 'healedVia', 'archivedReason', 'backend', 'prLinks', 'prUnlinked', 'todos', 'files', 'startRepo', 'editedRepos', 'parked', 'nonInteractive', 'transcriptCwd', 'doubtedCheckpoints', 'liveLink', 'transcriptTurns', 'wasLive', 'headless', 'startedFrom', 'startProject', 'backgroundList', 'doneAt', 'recap']
+  'startSource', 'historyTurns', 'healedAt', 'healedVia', 'archivedReason', 'backend', 'prLinks', 'prUnlinked', 'todos', 'files', 'startRepo', 'editedRepos', 'parked', 'nonInteractive', 'transcriptCwd', 'doubtedCheckpoints', 'liveLink', 'transcriptTurns', 'wasLive', 'headless', 'startedFrom', 'startProject', 'backgroundList', 'doneAt', 'recap', 'reviewed', 'wtLook', 'prShort']
 
 export const SESSION_FIELDS = ['id', 'title', 'titleSource', 'machine', 'cwd', 'repo', 'transcriptPath', 'model', 'surface', 'capture',
   'status', 'startedAt', 'lastActivityAt', 'lastHeartbeatAt', 'endedAt', 'endReason', 'turns', 'lastCheckpointId',
@@ -1622,8 +1622,13 @@ export const NOTHING_TO_CHECKPOINT = 'Nothing to checkpoint yet — no messages 
 // clip). The board and the daemon use ui/cp-text.js stripChannel; this copy is
 // here because the mod ships on its own. A test holds the two to the same answers.
 const CH_PAIR = /<channel\b[^>]*>([\s\S]*?)<\/channel\s*>/g
+// 2026-10-29: Claude Code's wrapper for a prompt our plugin submits between turns
+// ("The leftoff plugin sent a message:\n<words>\n\nThis is how Claude Code surfaces a prompt …").
+const PLUGIN_WRAP = /^\s*The leftoff plugin sent a message:\s*\n([\s\S]*?)(?:\n\s*\nThis is how Claude Code surfaces a prompt[\s\S]*)?$/i
 export function stripChannel(s) {
   let t = String(s == null ? '' : s)
+  const pw = PLUGIN_WRAP.exec(t)
+  if (pw) t = pw[1]
   if (!/<\/?channel\b/i.test(t)) return t.trim()
   for (let i = 0; i < 8 && CH_PAIR.test(t); i++) { CH_PAIR.lastIndex = 0; t = t.replace(CH_PAIR, '$1') }
   CH_PAIR.lastIndex = 0
@@ -1667,7 +1672,9 @@ export function joinListLines(t) {
 // last error, edited files not yet committed) or empty.
 export function heuristicCheckpoint(messages, session = {}, { length = 'short', cwd } = {}) {
   const ms_ = (messages || []).map((m) => (m && m.role === 'user' && typeof m.text === 'string' && /<\/?channel\b/i.test(m.text) ? { ...m, text: stripChannel(m.text) } : m))
-  const lastUser = [...ms_].reverse().find((m) => m.role === 'user' && m.text && m.text.trim())
+  // 2026-10-29: Claude Code's own wrappers (<task-notification>, <system-reminder>…) aren't what you asked for,
+  // so they never become "Working on: “<task-notification>…”"
+  const lastUser = [...ms_].reverse().find((m) => m.role === 'user' && m.text && m.text.trim() && !NOT_A_PROMPT.test(m.text))
   const lastAssistant = [...ms_].reverse().find((m) => m.role === 'assistant' && m.text && m.text.trim())
   let lastError = null
   for (let i = ms_.length - 1; i >= 0 && !lastError; i--) {
