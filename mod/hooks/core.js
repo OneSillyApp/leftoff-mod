@@ -506,6 +506,14 @@ export function renderCheckpointMd(cp) {
   // Informative / long checkpoints (v0.4.6): sections below the three lines.
   // Older readers only pick up the **Label:** lines, so they still work.
   const bullet = (x) => '- ' + oneLine(x).replace(/^\*+/, '')
+  // 2026-11-03 decision memory: the decisions this checkpoint saw, first of the
+  // sections, so an older reader (no section open yet) skips the heading and its lines.
+  // 2026-11-06: what the session's commands show got done (workFacts), first of all, so the
+  // digest can say what shipped in past tense; an older reader skips the heading and its lines
+  const work = (Array.isArray(cp.work) ? cp.work : []).map(renderWorkLine).filter(Boolean)
+  if (work.length) { lines.push('', '### ' + WORK_TITLE); for (const w of work) lines.push('- ' + w) }
+  const decided = cleanDecided(cp.decided)
+  if (decided.length) { lines.push('', '### ' + DECIDED_TITLE); for (const d of decided) lines.push(renderDecidedLine(d)) }
   for (const k of SECTION_ORDER) {
     const v = cp[k]
     if (k === 'recap') { if (v) lines.push('', '### ' + SECTION_TITLES[k], oneLine(v).replace(/^\*+/, '')); continue }
@@ -562,7 +570,15 @@ export function parseCheckpointMd(text) {
   if (cp.format === 'markdown') for (const f of ['doing', 'stoppedAt', 'next']) cp[f] = cp[f].replace(/\n{3,}/g, '\n\n').trim()
   const sec = []
   for (; k < lines.length; k++) { if (/^Resume: `/.test(lines[k])) break; sec.push(lines[k]) }
+  // 2026-11-06: "### Got done" lines are facts in a fixed shape (renderWorkLine); read them here, not as model prose
+  const work = []
+  let inWork = false
+  for (const l of sec) {
+    if (/^###\s/.test(l)) { inWork = l.replace(/^###\s+/, '').trim() === WORK_TITLE; continue }
+    if (inWork) { const f = parseWorkLine(l); if (f) work.push(f) }
+  }
   Object.assign(cp, parseSections(sec))
+  if (work.length) cp.work = work
   return cp
 }
 
@@ -683,7 +699,7 @@ const SESSION_ORDER = ['id', 'title', 'title_source', 'machine', 'cwd', 'repo', 
 export const SESSION_EXTRA = ['inTurn', 'needsInput', 'backgroundTasks', 'turnsSinceCheckpoint', 'dormantStretch',
   'finalCheckpointDone', 'firstPrompt', 'lastPreview', 'lastNotification', 'lastEventAt', 'statusChanges', 'folder',
   'pid', 'tty', 'pidStartedAt', 'pidSource', 'term', 'closedAt', 'answers', 'lastNotificationMessage', 'needsInputAt', 'question', 'questionAt',
-  'startSource', 'historyTurns', 'healedAt', 'healedVia', 'archivedReason', 'backend', 'prLinks', 'prUnlinked', 'todos', 'files', 'startRepo', 'editedRepos', 'parked', 'nonInteractive', 'transcriptCwd', 'doubtedCheckpoints', 'liveLink', 'transcriptTurns', 'wasLive', 'headless', 'startedFrom', 'startProject', 'backgroundList', 'doneAt', 'recap', 'reviewed', 'wtLook', 'prShort']
+  'startSource', 'historyTurns', 'healedAt', 'healedVia', 'archivedReason', 'backend', 'prLinks', 'prUnlinked', 'todos', 'files', 'startRepo', 'editedRepos', 'parked', 'nonInteractive', 'transcriptCwd', 'doubtedCheckpoints', 'liveLink', 'transcriptTurns', 'wasLive', 'headless', 'startedFrom', 'startProject', 'backgroundList', 'doneAt', 'recap', 'reviewed', 'wtLook', 'prShort', 'decisionsGiven']
 
 export const SESSION_FIELDS = ['id', 'title', 'titleSource', 'machine', 'cwd', 'repo', 'transcriptPath', 'model', 'surface', 'capture',
   'status', 'startedAt', 'lastActivityAt', 'lastHeartbeatAt', 'endedAt', 'endReason', 'turns', 'lastCheckpointId',
@@ -900,10 +916,11 @@ export function computeStatus(s, now, cfg = DEFAULT_CONFIG) {
     // fire), so a turn that has been silent for twice the dormancy window is
     // treated as over. The mod sees turn.complete for aborted turns too.
     // 0.8.0: a Codex rollout shows no end for a turn Codex was killed in, either.
-    if ((s.capture === 'hooks' || s.capture === 'codex') && idle >= 2 * dormantAfter) return 'dormant'
+    // 2026-11-06: a subagent working is the turn going on, however quiet the session's own hooks are
+    if ((s.capture === 'hooks' || s.capture === 'codex') && idle >= 2 * dormantAfter && !(s.subagents && s.subagents.n > 0)) return 'dormant'
     return 'active'
   }
-  if (s.backgroundTasks > 0) return 'background'
+  if (s.backgroundTasks > 0 || (s.subagents && s.subagents.n > 0)) return 'background' // 2026-11-06: subagents working (the daemon reads them, src/subagents.js), a turn's end missed or not
   return idle >= dormantAfter ? 'dormant' : 'waiting'
 }
 
@@ -1331,6 +1348,189 @@ export function transcriptSlice(messages, { maxInputChars = 24000, cwd } = {}) {
   return blocks.reverse().join('\n')
 }
 
+// ---------------------------------------------------------------- work facts (2026-11-06)
+//
+// What a session got done, read from the commands it ran and what they printed,
+// never from a model: commits ("[branch abc1234] subject"), PRs opened (gh pr
+// create's URL) and merged (gh pr merge, or GitHub's MCP merge tool), branches
+// pushed, and the last test run with its counts. A checkpoint keeps them under
+// "### Got done", one line each, so the digest can say "Merged PR #53: …" in
+// past tense instead of the last status line ("PR 53 was ready to merge").
+export const WORK_TITLE = 'Got done'
+export const WORK_MAX = { prs: 6, commits: 10, pushes: 3 }
+
+const quoted = (s) => s == null ? '' : String(s)
+function argOf(cmd, names) {
+  for (const n of names) {
+    const re = new RegExp('(?:^|\\s)' + n.replace(/-/g, '\\-') + '(?:=|\\s+)(?:"((?:[^"\\\\]|\\\\.)*)"|\'([^\']*)\'|(\\S+))')
+    const m = String(cmd).match(re)
+    if (m) return quoted(m[1] != null ? m[1].replace(/\\(.)/g, '$1') : m[2] != null ? m[2] : m[3])
+  }
+  return ''
+}
+const firstLineOf = (t) => String(t || '').split('\n').map((x) => x.trim()).find(Boolean) || ''
+const TEST_CMD = /(?:^|[\s;&|(])((?:(?:env\s+(?:-u\s+\S+\s+)*)?(?:timeout\s+(?:-k\s+\S+\s+)?\S+\s+)?)?(?:(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?test(?::[\w:.-]+)?|node\s+(?:--?[\w-]+(?:[= ]\S+)?\s+)*--test\b|npx\s+(?:vitest|jest|mocha)|vitest|jest|pytest|python3?\s+-m\s+pytest|go\s+test|cargo\s+test|mocha|rspec|swift\s+test|make\s+test|deno\s+test))/
+function testCounts(text) {
+  const t = String(text || '')
+  let m, passed = null, failed = null
+  if ((m = t.match(/test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed/))) return { passed: +m[1], failed: +m[2] }
+  const np = [...t.matchAll(/^\s*(?:#|ℹ)\s*pass\s+(\d+)\s*$/gm)].pop(), nf = [...t.matchAll(/^\s*(?:#|ℹ)\s*fail\s+(\d+)\s*$/gm)].pop()
+  if (np || nf) return { passed: np ? +np[1] : 0, failed: nf ? +nf[1] : 0 }
+  if ((m = t.match(/^\s*Tests:?\s+(.*)$/m)) && /\d+ (?:passed|failed)/.test(m[1])) {
+    const p = m[1].match(/(\d+) passed/), f = m[1].match(/(\d+) failed/)
+    return { passed: p ? +p[1] : 0, failed: f ? +f[1] : 0 }
+  }
+  const lines = t.split('\n').filter((l) => /\d+ (?:passed|failed)\b/.test(l))
+  if (lines.length) {
+    const l = lines[lines.length - 1], p = l.match(/(\d+) passed/), f = l.match(/(\d+) failed/)
+    passed = p ? +p[1] : 0; failed = f ? +f[1] : 0
+    return { passed, failed }
+  }
+  return null
+}
+const PR_URL = /https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/
+
+export function workFacts(messages) {
+  const prs = new Map() // number -> { kind: 'pr', number, title, state, repo }
+  const commits = [], pushes = []
+  let tests = null
+  const results = new Map()
+  for (const m of messages || []) for (const r of m.toolResults || []) if (r && r.tool_use_id) results.set(r.tool_use_id, r)
+  const pr = (number, patch) => {
+    const n = Number(number)
+    if (!n) return
+    const cur = prs.get(n) || { kind: 'pr', number: n, title: '', state: 'opened', repo: null }
+    // merged is final: a later "opened" (a re-run of create) doesn't take it back
+    const state = cur.state === 'merged' ? 'merged' : (patch.state || cur.state)
+    prs.delete(n) // newest last
+    prs.set(n, { ...cur, ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v)), state })
+  }
+  for (const m of messages || []) {
+    if (m.role !== 'assistant') continue
+    for (const t of m.toolUses || []) {
+      const name = String(t.tool || t.name || '')
+      const res = (t.tool_use_id && results.get(t.tool_use_id)) || null
+      const text = String(t.text != null ? t.text : (res && res.text) || '')
+      const isError = !!(t.isError || (res && res.isError))
+      const input = t.input || {}
+      // GitHub's MCP tools (mcp__github__create_pull_request / merge_pull_request)
+      if (/(?:^|__)create_pull_request$/.test(name)) {
+        if (isError) continue
+        const u = text.match(PR_URL), n = (u && u[2]) || ((text.match(/"number"\s*:\s*(\d+)/) || [])[1])
+        pr(n, { title: clip(String(input.title || ''), 120), state: 'opened', repo: u ? u[1] : (input.owner && input.repo ? input.owner + '/' + input.repo : null) })
+        continue
+      }
+      if (/(?:^|__)merge_pull_request$/.test(name)) {
+        if (isError || /not mergeable|failed|error/i.test(firstLineOf(text))) continue
+        pr(input.pull_number || input.pullNumber || input.number, { state: 'merged', title: clip(String(input.commit_title || ''), 120).replace(/\s*\(#\d+\)$/, ''), repo: input.owner && input.repo ? input.owner + '/' + input.repo : null })
+        continue
+      }
+      if (name !== 'Bash' || !input.command) continue
+      const cmd = String(input.command)
+      if (/\bgit\b[^\n|;&]*\bcommit\b/.test(cmd) && !/--dry-run/.test(cmd)) {
+        for (const c of text.matchAll(/^\[([^\]\s]+)(?: \([^)]*\))? ([0-9a-f]{7,40})\] (.+)$/gm)) {
+          const subject = clip(c[3].trim(), 120)
+          const i = commits.findIndex((x) => x.subject === subject) // an --amend: the new sha, one line
+          if (i >= 0) commits.splice(i, 1)
+          commits.push({ kind: 'commit', sha: c[2].slice(0, 7), subject, branch: c[1] })
+        }
+      }
+      if (/\bgh\s+pr\s+create\b/.test(cmd) && !isError) {
+        const u = text.match(PR_URL)
+        if (u) pr(u[2], { title: clip(argOf(cmd, ['--title', '-t']), 120), state: 'opened', repo: u[1], branch: argOf(cmd, ['--head', '-H']).replace(/^[\w.-]+:/, '') || pushes[pushes.length - 1] || (commits.length ? commits[commits.length - 1].branch : '') })
+      }
+      if (/\bgh\s+pr\s+merge\b/.test(cmd) && !isError) {
+        const n = (cmd.match(/\bgh\s+pr\s+merge\s+(?:[^\s-]\S*\/pull\/)?#?(\d+)\b/) || [])[1] || (text.match(/pull request (?:[\w.-]+\/[\w.-]+)?#(\d+)/i) || [])[1] || ((text.match(PR_URL) || [])[2])
+        const title = (text.match(/pull request (?:[\w.-]+\/[\w.-]+)?#\d+ \((.+)\)\s*$/im) || [])[1] || ''
+        if (/automatically merged|auto-?merge|merge queue|will be merged/i.test(text) || /--auto\b/.test(cmd)) pr(n, { state: 'auto', title: clip(title, 120) })
+        else if (!/not mergeable|failed|error:/i.test(text)) pr(n, { state: 'merged', title: clip(title, 120) })
+      }
+      if (/\bgit\s+push\b/.test(cmd) && !isError) {
+        const b = [...text.matchAll(/(?:\[new branch\]|\.\.|\+)\s*\S*\s+(\S+)\s+->\s+(\S+)/g)].map((x) => x[2]).pop() || [...text.matchAll(/\s(\S+)\s+->\s+(\S+)/g)].map((x) => x[2]).pop()
+        if (b) { const i = pushes.indexOf(b); if (i >= 0) pushes.splice(i, 1); pushes.push(b) }
+      }
+      const tc = cmd.match(TEST_CMD)
+      if (tc) {
+        const counts = testCounts(text)
+        if (counts || isError) tests = { kind: 'tests', ok: !isError && (!counts || counts.failed === 0), passed: counts ? counts.passed : null, failed: counts ? counts.failed : null, cmd: clip(tc[1].replace(/^env\s+(?:-u\s+\S+\s+)*/, '').replace(/^timeout\s+(?:-k\s+\S+\s+)?\S+\s+/, '').replace(/\s--?(?:import|require|loader|r)[= ]\S+/g, '').trim(), 60) }
+      }
+    }
+  }
+  const out = []
+  const prList = [...prs.values()].slice(-WORK_MAX.prs)
+  out.push(...prList.filter((p) => p.state === 'merged'), ...prList.filter((p) => p.state !== 'merged'))
+  out.push(...commits.slice(-WORK_MAX.commits))
+  out.push(...pushes.slice(-WORK_MAX.pushes).map((branch) => ({ kind: 'push', branch })))
+  if (tests) out.push(tests)
+  return out
+}
+
+const oneL = (s) => String(s == null ? '' : s).replace(/\s*\n\s*/g, ' ').trim()
+// One fact, one line; parseWorkLine reads it back.
+export function renderWorkLine(f) {
+  if (!f) return ''
+  if (f.kind === 'pr') {
+    const head = (f.state === 'merged' ? 'Merged' : f.state === 'auto' ? 'Set to merge' : 'Opened') + ' PR #' + f.number + (f.repo ? ' (' + f.repo + ')' : '') + (f.branch ? ' from ' + f.branch : '')
+    return head + (f.title ? ': ' + oneL(f.title) : '')
+  }
+  if (f.kind === 'commit') return 'Committed ' + f.sha + (f.branch ? ' on ' + f.branch : '') + ': ' + oneL(f.subject)
+  if (f.kind === 'push') return 'Pushed ' + f.branch
+  if (f.kind === 'tests') {
+    const n = f.passed != null ? f.passed + ' passed' + (f.failed ? ', ' + f.failed + ' failed' : '') : ''
+    return 'Tests ' + (f.ok ? 'passed' : 'failed') + (n ? ': ' + n : '') + (f.cmd ? ' (' + oneL(f.cmd).replace(/[()]/g, '') + ')' : '')
+  }
+  return ''
+}
+export function parseWorkLine(line) {
+  const t = String(line || '').replace(/^\s*[-*•]\s*/, '').trim()
+  let m
+  if ((m = t.match(/^(Merged|Opened|Set to merge) PR #(\d+)(?: \(([\w.-]+\/[\w.-]+)\))?(?: from (\S+?))?(?::\s*(.*))?$/))) return { kind: 'pr', number: +m[2], state: m[1] === 'Merged' ? 'merged' : m[1] === 'Opened' ? 'opened' : 'auto', repo: m[3] || null, ...(m[4] ? { branch: m[4] } : {}), title: (m[5] || '').trim() }
+  if ((m = t.match(/^Committed ([0-9a-f]{7,40})(?: on (\S+))?:\s*(.*)$/))) return { kind: 'commit', sha: m[1], branch: m[2] || null, subject: m[3].trim() }
+  if ((m = t.match(/^Pushed (\S+)$/))) return { kind: 'push', branch: m[1] }
+  if ((m = t.match(/^Tests (passed|failed)(?::\s*(\d+) passed(?:, (\d+) failed)?)?(?: \((.*)\))?$/))) return { kind: 'tests', ok: m[1] === 'passed', passed: m[2] != null ? +m[2] : null, failed: m[2] != null ? +(m[3] || 0) : null, cmd: m[4] || '' }
+  return null
+}
+// "PR 53 is ready to merge" / "Merge PR 53" about a PR that has merged: a status line gone stale.
+export const STATUSY_PR = /\bPR\s*#?(\d+)\b[^.;]{0,60}?\b(?:ready to merge|ready for review|ready to land|awaiting (?:review|merge|approval)|waiting (?:on|for) (?:review|merge|approval|checks|CI)|open(?:ed)?(?: and)? (?:for|awaiting)|in review|pending (?:review|merge))/i
+export const STALE_NEXT_PR = /\b(?:merge|land|ship|review|approve|squash)\b[^.;]{0,40}?\bPR\s*#?(\d+)/i
+// A checkpoint whose Stopped at / Next calls a PR its own facts show merged ready or next to merge:
+// Stopped at becomes what the facts say, Next is dropped (the digest's next step comes from elsewhere).
+// -> { stoppedAt, next, corrected: [fields] }; nothing changed when nothing is contradicted.
+export function reconcileWithWork(cp, work) {
+  const merged = new Map((work || []).filter((f) => f && f.kind === 'pr' && f.state === 'merged').map((f) => [f.number, f]))
+  const out = { stoppedAt: cp.stoppedAt, next: cp.next, corrected: [] }
+  if (!merged.size) return out
+  const one = (t) => String(t || '').replace(/\s+/g, ' ')
+  const m = one(cp.stoppedAt).match(STATUSY_PR)
+  if (m && merged.has(Number(m[1]))) {
+    const pr = merged.get(Number(m[1]))
+    const tests = (work || []).filter((f) => f.kind === 'tests').pop()
+    out.stoppedAt = 'PR #' + pr.number + (pr.title ? ' (' + clip(pr.title, 80) + ')' : '') + ' is merged' + (tests ? '; tests ' + (tests.ok ? 'pass' : 'fail') + (tests.passed != null ? ' (' + (tests.ok ? tests.passed + ' passed' : tests.failed + ' failed') + ')' : '') : '') + '.'
+    out.corrected.push('stoppedAt')
+  }
+  const n = one(cp.next).match(STALE_NEXT_PR)
+  if (n && merged.has(Number(n[1]))) { out.next = ''; out.corrected.push('next') }
+  return out
+}
+// A work list from anywhere (the mod's POST, a file) made safe: only what renders and reads back.
+export function cleanWork(list) {
+  const out = []
+  for (const f of Array.isArray(list) ? list : []) {
+    const w = typeof f === 'string' ? parseWorkLine(f) : parseWorkLine(renderWorkLine(f))
+    if (w) out.push(w)
+  }
+  return out.slice(0, WORK_MAX.prs + WORK_MAX.commits + WORK_MAX.pushes + 1)
+}
+// The same fact in two checkpoints is one fact (a commit by its subject, since an amend changes the sha).
+export function workKey(f) {
+  if (!f) return ''
+  if (f.kind === 'pr') return 'pr:#' + f.number
+  if (f.kind === 'commit') return 'commit:' + String(f.subject || '').toLowerCase()
+  if (f.kind === 'push') return 'push:' + f.branch
+  if (f.kind === 'tests') return 'tests'
+  return ''
+}
+
 // ---------------------------------------------------------------- checkpoint length (v0.4.6)
 //
 // config summary.length picks how much a checkpoint says. Every length keeps the
@@ -1383,16 +1583,23 @@ const CHECKPOINT_BASE = [
   'You write checkpoints for a developer juggling many coding-agent sessions, read when they come back after half an hour, a day or a weekend. Given the recent transcript of ONE session, start with exactly these five lines:',
   'Goal: <the outcome the developer is after, from what they asked for, in a few plain words; not the latest step. Keep the previous goal unless they changed course or it is done and they moved on>',
   'Progress: <one of Just started, Underway, Mostly done, Done, Stuck> - <what is left between here and the goal, a few words>',
-  'Doing: <what the session was working on, one sentence, concrete nouns: files, features, errors>',
-  'Stopped at: <the exact state when it went quiet: what passed, what failed, what is half-done; say what was actually run or checked, and what is only assumed>',
+  'Doing: <what the session got done or was working on, one sentence, concrete nouns: files, features, errors; past tense for what is finished, e.g. "Merged PR #53, which keeps the reply box above the keyboard">',
+  'Stopped at: <the exact state when it went quiet, as outcomes: what passed, what failed, what is half-done, what is merged and what is not; say what was actually run or checked, and what is only assumed>',
   'Next: <the single next action a human or the agent should take>',
   'If the session is blocked on the human (a question, a permission, a decision), start Next with "YOU:".',
+  'Say outcomes, not statuses: "Merged PR #53" or "Opened PR #53, not merged yet", never "PR 53 was ready to merge". The "Verified from the commands\' output" line is the record of commits, PRs, pushes and tests: never contradict it, and never claim a merge, commit or passing test it does not show.',
   'Describe only what the transcript shows; the lines above it (repo, branch, title, what was asked, previous checkpoint) are background and may be out of date.',
+]
+// 2026-11-03 decision memory: only when the transcript shows one, quoted, never invented.
+const DECIDED_SECTION = [
+  'Only if the transcript shows a decision (a choice between real alternatives that the developer made or approved, a plan they approved, a correction they gave such as "no, do X instead", or a trade-off the agent chose and said so), add after those lines a "Decided:" heading and one "- " line per decision, at most 4:',
+  '- <what was decided, in the words the transcript uses> · why: <the reason given, one line> · over: <alternative>; <alternative> · from: <asked | plan | correction | agent>',
+  'A task done, a file edited or a routine step is not a decision, and neither is a one-off choice about this task right now (who does a step, whether to commit, push or deploy now). Never invent a choice or a reason the transcript does not show. When unsure, or when there is none, leave the Decided heading out entirely. Skip decisions listed as already recorded.',
 ]
 const INFORMATIVE_SECTIONS = [
   'Then these sections, each a heading line followed by "- " bullets (write "- none" when there is nothing; never invent):',
-  'Decisions:',
-  '- <a decision made in the session and the reason, one line each, at most 4>',
+  'Approach notes:',
+  '- <how the work is being done: the approach taken, a pattern or constraint it follows; one line each, at most 4. Not a choice between alternatives: those go only under Decided>',
   'Open questions:',
   '- <an unresolved question or uncertainty, at most 3>',
   'Files:',
@@ -1409,9 +1616,9 @@ const LONG_SECTIONS = [
   '3. <the step after that>',
 ]
 export const CHECKPOINT_SYSTEMS = {
-  short: [...CHECKPOINT_BASE, 'Write only those five lines.', 'Optionally a 6th line "Title: <max 6 words>" if asked for a title.', 'No preamble. No markdown. Under 90 words total.'].join('\n'),
-  informative: [...CHECKPOINT_BASE, ...INFORMATIVE_SECTIONS, 'Optionally a final line "Title: <max 6 words>" if asked for a title.', 'No preamble. No other markdown. Under 280 words total.'].join('\n'),
-  long: [...CHECKPOINT_BASE, ...INFORMATIVE_SECTIONS, ...LONG_SECTIONS, 'Optionally a final line "Title: <max 6 words>" if asked for a title.', 'No preamble. No other markdown. Under 630 words total.'].join('\n'),
+  short: [...CHECKPOINT_BASE, ...DECIDED_SECTION, 'Write only those five lines (and Decided, when there is one).', 'Optionally a 6th line "Title: <max 6 words>" if asked for a title.', 'No preamble. No markdown. Under 90 words total.'].join('\n'),
+  informative: [...CHECKPOINT_BASE, ...DECIDED_SECTION, ...INFORMATIVE_SECTIONS, 'Optionally a final line "Title: <max 6 words>" if asked for a title.', 'No preamble. No other markdown. Under 280 words total.'].join('\n'),
+  long: [...CHECKPOINT_BASE, ...DECIDED_SECTION, ...INFORMATIVE_SECTIONS, ...LONG_SECTIONS, 'Optionally a final line "Title: <max 6 words>" if asked for a title.', 'No preamble. No other markdown. Under 630 words total.'].join('\n'),
 }
 // The short prompt, as before v0.4.6 (kept under its old name for anything importing it).
 export const CHECKPOINT_SYSTEM = CHECKPOINT_SYSTEMS.short
@@ -1463,28 +1670,216 @@ export function buildCheckpointPrompt({ session, previous, messages, cfg = DEFAU
   head.push('Previous checkpoint: ' + prev, 'Files touched since then: ' + (files.length ? files.join(', ') : 'none'))
   if (Array.isArray(uncommitted)) head.push('Uncommitted files now: ' + (uncommitted.length ? uncommitted.slice(0, 12).join(', ') + (uncommitted.length > 12 ? ' and ' + (uncommitted.length - 12) + ' more' : '') : 'none (everything is committed)'))
   if (userNote) head.push('Note from the developer: ' + userNote)
+  // 2026-11-03: already read from its questions and plans, no model needed; redacted like the prompt, since they're saved
+  const red = (t) => redact(String(t || ''), (cfg.redact && cfg.redact.patterns) || [])
+  const found = decisionsFromMessages(messages).map((d) => ({ ...d, text: red(d.text), why: red(d.why), alternatives: d.alternatives.map(red) }))
+  if (found.length) head.push('Decisions already recorded from the session\'s questions and plans (don\'t repeat them): ' + found.map((d) => '“' + clip(d.text, 120) + '”').join('; '))
+  // 2026-11-06: what the commands' own output shows got done, so the model says "Merged PR #53" and not "PR 53 was ready to merge"
+  const work = workFacts(messages).map((f) => (f.kind === 'pr' || f.kind === 'commit' ? { ...f, title: f.title && red(f.title), subject: f.subject && red(f.subject) } : f)).map((f) => Object.fromEntries(Object.entries(f).filter(([, v]) => v !== undefined)))
+  head.push('Verified from the commands\' output (git, gh, the test runner) this session: ' + (work.length ? work.map(renderWorkLine).join('; ') : 'no commit, PR, push or test run'))
   if (session.needsInput) head.push('State: the session is waiting on the developer (' + (session.lastNotification || 'a prompt') + ').')
   if (wantTitle) head.push('Also write the line: Title: <max 6 words>.')
   const slice = transcriptSlice(messages, { maxInputChars, cwd })
   const patterns = (cfg.redact && cfg.redact.patterns) || []
   const prompt = redact(head.join('\n') + '\nTranscript (oldest→newest, trimmed):\n' + (slice || '(empty)'), patterns)
-  return { system: CHECKPOINT_SYSTEMS[len], prompt, filesTouched: files, inputChars: prompt.length, length: len, maxTokens: SUMMARY_LENGTHS[len].maxTokens }
+  return { system: CHECKPOINT_SYSTEMS[len], prompt, filesTouched: files, inputChars: prompt.length, length: len, maxTokens: SUMMARY_LENGTHS[len].maxTokens, found, work }
+}
+
+// ---------------------------------------------------------------- decisions (2026-11-03)
+//
+// A decision is a choice between real alternatives that someone made or
+// approved in a session: a question you answered from its options, a plan you
+// approved, a correction you gave, or a trade-off the agent chose and said so.
+// Not a task done or a file edited. A checkpoint with none is normal.
+// In a checkpoint each is one line under "### Decided":
+//   - <what was decided> · why: <one line> · over: <alt>; <alt> · from: asked
+// Both "·" and "|" separate the labelled parts (a model may write either).
+export const DECIDED_TITLE = 'Decided'
+export const DECIDED_MAX = 8
+export const DECISION_SOURCES = ['asked', 'plan', 'correction', 'agent']
+const DEC_PART = /\s+[·|]\s+(why|over|instead of|alternatives|from|source)\s*:\s*/i
+
+export function parseDecidedLine(line) {
+  let t = String(line == null ? '' : line).replace(/^\s*(?:[-*•]|\d+[.)])\s+/, '').replace(/\*\*/g, '').trim()
+  if (!t || NONE_RE.test(t)) return null
+  const d = { text: '', why: '', alternatives: [], source: 'agent' }
+  const m0 = t.match(/^\[(asked|plan|correction|agent)\]\s*/i) // "[asked] …" also reads
+  if (m0) { d.source = m0[1].toLowerCase(); t = t.slice(m0[0].length) }
+  const parts = t.split(DEC_PART)
+  d.text = parts[0].trim()
+  for (let i = 1; i + 1 < parts.length; i += 2) {
+    const k = parts[i].toLowerCase(), v = parts[i + 1].trim()
+    if (k === 'why') d.why = v
+    else if (k === 'from' || k === 'source') { const src = v.toLowerCase().replace(/[^a-z]/g, ''); if (DECISION_SOURCES.includes(src)) d.source = src }
+    else d.alternatives = v.split(/\s*;\s*/).map((x) => x.trim()).filter((x) => x && !NONE_RE.test(x))
+  }
+  return cleanDecided([d])[0] || null
+}
+
+export function renderDecidedLine(d) {
+  const safe = (x) => oneLine(x).replace(/\s+[·|]\s+/g, ' - ')
+  return '- ' + safe(d.text) + (d.why ? ' · why: ' + safe(d.why) : '') + (d.alternatives && d.alternatives.length ? ' · over: ' + d.alternatives.map((a) => safe(a).replace(/;/g, ',')).join('; ') : '') + ' · from: ' + (d.source || 'agent')
+}
+
+// Any list -> [{ text, why, alternatives, source }], one line each, deduplicated by text.
+export function cleanDecided(list) {
+  const out = [], seen = new Set()
+  for (const x of Array.isArray(list) ? list : []) {
+    if (!x || typeof x !== 'object') continue
+    const text = clip(oneLine(x.text).replace(/^["“]|["”]$/g, ''), 240)
+    if (!text || NONE_RE.test(text)) continue
+    const k = decisionNorm(text)
+    if (seen.has(k)) continue
+    seen.add(k)
+    const alternatives = (Array.isArray(x.alternatives) ? x.alternatives : []).map((a) => clip(oneLine(a), 120)).filter(Boolean).slice(0, 6)
+    out.push({ text, why: clip(oneLine(x.why), 240), alternatives, source: DECISION_SOURCES.includes(x.source) ? x.source : 'agent' })
+    if (out.length >= DECIDED_MAX) break
+  }
+  return out
+}
+export const decisionNorm = (t) => String(t || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim()
+
+// A decision's key in a repo's log: the same decision from the same session is
+// the same entry wherever it was read (the mod or the daemon). 12 hex characters.
+export function decisionKey(sessionId, text) {
+  const str = String(sessionId || '') + '\n' + decisionNorm(text)
+  let h1 = 0x811c9dc5, h2 = 0x01000193 ^ 0x5bd1e995
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i)
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0
+    h2 = Math.imul(h2 ^ c, 0x5bd1e995) >>> 0
+    h2 = (h2 ^ (h2 >>> 15)) >>> 0
+  }
+  return (h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0')).slice(0, 12)
+}
+
+// "User has answered your questions: "Q"="A", "Q2"="B". You can now continue…" -> { Q: A }
+function questionAnswers(text, questions) {
+  const out = {}
+  const t = String(text || '')
+  for (let i = 0; i < questions.length; i++) {
+    const q = questions[i]
+    const at = t.indexOf('"' + q + '"="')
+    if (at < 0) continue
+    const from = at + q.length + 4
+    let end = -1
+    for (let j = i + 1; j < questions.length && end < 0; j++) { const n = t.indexOf('", "' + questions[j] + '"="', from); if (n >= 0) end = n }
+    if (end < 0) { const m = t.slice(from).search(/"(?:\.\s|\.?$|,\s*"[^"]*"=")/); end = m >= 0 ? from + m : t.length }
+    out[q] = t.slice(from, end).trim()
+  }
+  return out
+}
+
+const PLAN_OK = /(?:approved your plan|user has approved|plan (?:was )?approved)/i
+function planHeadline(plan) {
+  const lines = String(plan || '').replace(/\r\n?/g, '\n').split('\n').map((l) => l.trim()).filter(Boolean)
+  const h = lines.find((l) => /^#{1,3}\s+\S/.test(l)) || lines[0] || ''
+  return h.replace(/^#{1,6}\s+/, '').replace(/^(?:plan|implementation plan)\s*[:\-–—]\s*/i, '').replace(/\*\*/g, '').trim()
+}
+
+// 2026-11-05: a question about one task right now isn't a decision for the repo: who does it ("You update
+// it" / "I'll handle it"), or whether to go ahead with a commit, push, deploy and the like. Never recorded.
+const ACTOR_OPT = /^(?:you|i|i'll|i will|i'd|me|let me|we|we'll|leave it|someone)\b/i
+const NOW_Q = /\b(?:go ahead|proceed|right now|commit|push|merge|deploy|ship|publish|release|restart|open (?:a|the) pr|create (?:a|the) pr|who (?:should|will|does))\b/i
+const YESNO_OPT = /^(?:yes|no|y|n|ok|okay|sure|go ahead|do it|proceed|not now|later|skip|wait|stop|hold off|cancel|continue)\b/i
+export function isOneOffQuestion(q) {
+  const labels = (Array.isArray(q && q.options) ? q.options : []).map((o) => String((o && o.label) || o || '').replace(/\s*\(Recommended\)\s*/i, '').trim()).filter(Boolean)
+  if (labels.length < 2) return false
+  if (labels.every((l) => ACTOR_OPT.test(l))) return true
+  return NOW_Q.test(String((q && q.question) || '')) && labels.every((l) => YESNO_OPT.test(l))
+}
+
+// The transcript's own decisions, oldest first, and the answers it later changed:
+// a question asked again (same header, else the same question) and answered
+// differently keeps only the last answer; the earlier ones are `reversed` (texts).
+function readStated(messages) {
+  const out = [], at = new Map(), replaced = new Set()
+  for (const m of messages || []) {
+    if (!m || m.role !== 'assistant') continue
+    for (const u of m.toolUses || []) {
+      const name = u && (u.tool || u.name)
+      if (!u || u.isError || !u.input) continue
+      if (name === 'AskUserQuestion' && Array.isArray(u.input.questions) && u.text) {
+        const qs = u.input.questions.filter((q) => q && q.question && Array.isArray(q.options) && q.options.length >= 2)
+        const ans = questionAnswers(u.text, qs.map((q) => String(q.question)))
+        for (const q of qs) {
+          const a = ans[q.question]
+          if (!a || isOneOffQuestion(q)) continue
+          const labels = q.options.map((o) => String((o && o.label) || o || '').trim()).filter(Boolean)
+          const picked = labels.filter((l) => a === l || a.split(/\s*,\s*/).includes(l))
+          const chosen = picked.length ? picked.join(', ') : a
+          const opt = q.options.find((o) => o && o.label === picked[0])
+          const d = {
+            text: clip(String(q.header ? q.header + ': ' : '') + chosen.replace(/\s*\(Recommended\)\s*/i, ''), 240),
+            why: opt && opt.description ? opt.description : '',
+            alternatives: labels.filter((l) => !picked.includes(l)).map((l) => l.replace(/\s*\(Recommended\)\s*/i, '')),
+            source: 'asked',
+          }
+          const topic = 'q:' + decisionNorm(q.header || q.question)
+          const was = at.get(topic)
+          if (was != null && decisionNorm(out[was].text) !== decisionNorm(d.text)) { replaced.add(out[was].text); out[was] = null }
+          if (was != null && out[was]) continue // the same answer again
+          at.set(topic, out.length); out.push(d)
+        }
+      }
+      if (name === 'ExitPlanMode' && u.text && PLAN_OK.test(u.text)) {
+        const head = planHeadline(u.input.plan)
+        if (head) out.push({ text: clip('Plan approved: ' + head, 240), why: '', alternatives: [], source: 'plan' })
+      }
+    }
+  }
+  const found = out.filter(Boolean)
+  const kept = new Set(found.map((d) => decisionNorm(d.text)))
+  return { found, reversed: [...replaced].filter((t) => !kept.has(decisionNorm(t))) }
+}
+
+// The decisions a transcript states outright, with no model: a question you
+// answered from its options (AskUserQuestion, the board's Needs you), its other
+// options as the alternatives, only its last answer; a plan you approved
+// (ExitPlanMode). Messages are src/transcript.js's shape, which is also
+// $.session.messages()'s.
+export function decisionsFromMessages(messages) {
+  return cleanDecided(readStated(messages).found)
+}
+
+// 2026-11-05: what the log settles on its own (src/decisions.js settleStated): the stated decisions,
+// redacted as checkpoints save them, and the texts of answers changed later in the session.
+export function statedDecisions(messages, patterns = []) {
+  const red = (t) => redact(String(t || ''), patterns || [])
+  const { found, reversed } = readStated(messages)
+  return {
+    found: cleanDecided(found).map((d) => ({ ...d, text: red(d.text), why: red(d.why), alternatives: d.alternatives.map(red) })),
+    reversed: reversed.map((t) => red(clip(oneLine(t), 240))),
+  }
+}
+
+// The checkpoint's decisions: what the transcript states outright first, then the model's.
+// earlier: decisions already in this session's previous checkpoints (by text), left out.
+export function mergeDecided(found, fromModel, { earlier = [] } = {}) {
+  const seen = new Set((earlier || []).map((d) => decisionNorm(d && d.text)))
+  return cleanDecided([...(found || []), ...(fromModel || [])]).filter((d) => !seen.has(decisionNorm(d.text)))
 }
 
 // The extra sections of an informative / long checkpoint, by the heading a
 // model (or a checkpoint file) uses for them.
 const SECTION_KEYS = {
-  'decisions': 'decisions', 'key decisions': 'decisions',
+  // 1i (testplan): the section is "Approach notes" now (real choices go only under Decided); a checkpoint
+  // written before, or a model still saying "Decisions:" / "Key decisions", reads into the same field.
+  'approach notes': 'decisions', 'approach': 'decisions', 'decisions': 'decisions', 'key decisions': 'decisions',
   'open questions': 'questions', 'questions': 'questions',
   'files': 'files', 'files touched': 'files',
   'didn\'t work': 'didntWork', 'didnt work': 'didntWork', 'did not work': 'didntWork', 'what didn\'t work': 'didntWork', 'what didnt work': 'didntWork', 'tried': 'didntWork',
   'recap': 'recap',
   'next steps': 'nextSteps', 'next 3 steps': 'nextSteps',
+  // 2026-11-06: "Got done" is written in code from the commands' output (workFacts); a model
+  // that writes the heading itself is not a source for it, so its lines are dropped
+  'got done': 'gotDone',
+  'decided': 'decided', // 2026-11-03 decision memory
 }
-export const SECTION_TITLES = { decisions: 'Key decisions', questions: 'Open questions', files: 'Files touched', didntWork: 'What didn\'t work', recap: 'Recap', nextSteps: 'Next steps' }
+export const SECTION_TITLES = { decisions: 'Approach notes', questions: 'Open questions', files: 'Files touched', didntWork: 'What didn\'t work', recap: 'Recap', nextSteps: 'Next steps' }
 const SECTION_ORDER = ['decisions', 'questions', 'files', 'didntWork', 'recap', 'nextSteps']
 const NONE_RE = /^(none|n\/a|nothing|-|—|none yet|no(ne)? (open )?questions?)\.?$/i
-const LIMITS = { decisions: 6, questions: 5, files: 10, didntWork: 5, nextSteps: 5 }
+const LIMITS = { decided: DECIDED_MAX, decisions: 6, questions: 5, files: 10, didntWork: 5, nextSteps: 5 }
 
 // "src/a.js — retry loop" / "`src/a.js`: why" -> { path, why }
 export function parseFileNote(text) {
@@ -1495,7 +1890,7 @@ export function parseFileNote(text) {
   return p ? { path: p[1], why: '' } : { path: '', why: t }
 }
 
-function emptyExtras() { return { decisions: [], questions: [], files: [], didntWork: [], recap: '', nextSteps: [] } }
+function emptyExtras() { return { decided: [], decisions: [], questions: [], files: [], didntWork: [], recap: '', nextSteps: [] } }
 export function hasExtras(cp) {
   return !!cp && (['decisions', 'questions', 'files', 'didntWork', 'nextSteps'].some((k) => Array.isArray(cp[k]) && cp[k].length) || !!cp.recap)
 }
@@ -1508,8 +1903,10 @@ function parseSections(lines) {
   const push = (k, v) => {
     v = String(v || '').replace(/\*\*/g, '').trim()
     if (!v || NONE_RE.test(v)) return
+    if (k === 'gotDone') return
     if (k === 'recap') { ex.recap = ex.recap ? ex.recap + ' ' + v : v; return }
     if (k === 'files') { const f = parseFileNote(v); if (f.path || f.why) ex.files.push(f); return }
+    if (k === 'decided') { const d = parseDecidedLine(v); if (d) ex.decided.push(d); return }
     ex[k].push(v)
   }
   for (const raw of lines) {
@@ -1528,8 +1925,11 @@ function parseSections(lines) {
     if (item) push(cur, item[1])
     else if (cur === 'recap') push(cur, line)
     else if (/^(doing|stopped at|next|title|open question|note|resume)\s*:/i.test(h)) cur = null
+    else if (cur === 'decided') continue // a decision is one bullet line; loose prose under the heading is not one
     else push(cur, line)
   }
+  // 1i: a line a model put under both Decided and the approach notes is a decision: it stays under Decided only
+  if (ex.decided.length && ex.decisions.length) { const dn = new Set(ex.decided.map((d) => decisionNorm(d.text))); ex.decisions = ex.decisions.filter((t) => !dn.has(decisionNorm(String(t).split(/\s+·\s+|\s+[-—–]\s+because\b/)[0]))) }
   for (const k of Object.keys(LIMITS)) ex[k] = ex[k].slice(0, LIMITS[k])
   ex.recap = clip(ex.recap, 1600)
   return ex
@@ -1707,6 +2107,8 @@ export function heuristicCheckpoint(messages, session = {}, { length = 'short', 
   else if (lastError) next = 'Look at the last error and decide whether to retry or change approach.'
   else if (lastEdit >= 0 && lastCommit < lastEdit) next = 'Commit, or keep going.'
   const base = { doing, stoppedAt, next, title: null, openQuestion: null, parseOk: true }
+  const found = decisionsFromMessages(ms_) // 2026-11-03: only what the transcript states outright; the heuristic guesses none
+  if (found.length) base.decided = found
   const len = normalizeLength(length)
   if (len === 'short') return base
   const ex = emptyExtras()
@@ -1733,7 +2135,7 @@ export function heuristicCheckpoint(messages, session = {}, { length = 'short', 
     ].filter(Boolean).join(' ')
     ex.nextSteps = next ? [next] : []
   }
-  return { ...base, ...ex }
+  return { ...base, ...ex, decided: base.decided || [] }
 }
 
 // Fallback title: {repo}@{branch} · {first 6 words of the first prompt}
@@ -1750,7 +2152,7 @@ export const TITLE_LANGUAGE = 'Write it in the same language as the user\'s own 
 export const TITLE_SYSTEM = 'Write a title of at most 6 words for a coding session, based on its first prompt. ' + TITLE_LANGUAGE + ' Reply with the title only, no quotes, no punctuation at the end.'
 
 export function cleanTitle(text) {
-  const t = String(text || '').replace(/<think>[\s\S]*?<\/think>/gi, '').split('\n').map((l) => l.trim()).find(Boolean) || ''
+  const t = stripChannel(String(text || '').replace(/<think>[\s\S]*?<\/think>/gi, '')).split('\n').map((l) => l.trim()).find(Boolean) || '' // 0.9.18: a model that echoes the Live wrapper
   return clip(t.replace(/^title\s*:\s*/i, '').replace(/^["'`*]+|["'`*.]+$/g, ''), 60)
 }
 

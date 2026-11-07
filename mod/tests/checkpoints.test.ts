@@ -65,11 +65,11 @@ test('commands: /cp, /cp-name, /leftoff (+ /checkpoints, its old name), /cp-catc
   const registered: string[] = []
   stubBasics(on, posts, { taken: ['cp'], logs, registered })
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/acme' })
-  expect(registered).toEqual(['cp-save', 'cp-name', 'leftoff', 'checkpoints', 'cp-catchup', 'cp-todo', 'cp-park', 'cp-done'])
+  expect(registered).toEqual(['cp-save', 'cp-name', 'leftoff', 'checkpoints', 'cp-catchup', 'cp-todo', 'cp-park', 'cp-decisions', 'cp-done'])
   expect(logs.join('\n')).toContain('using /cp-save instead of /cp')
   const health = posts.find((p) => String(p.url).endsWith('/v1/mod/health'))
   const body = JSON.parse(health.init.body)
-  expect(body.commands.map((c: any) => c.name)).toEqual(['cp-save', 'cp-name', 'leftoff', 'checkpoints', 'cp-catchup', 'cp-todo', 'cp-park', 'cp-done'])
+  expect(body.commands.map((c: any) => c.name)).toEqual(['cp-save', 'cp-name', 'leftoff', 'checkpoints', 'cp-catchup', 'cp-todo', 'cp-park', 'cp-decisions', 'cp-done'])
   expect(body.commands.every((c: any) => c.ok)).toBe(true)
 })
 
@@ -133,4 +133,64 @@ test('/cp-todo (v0.5.1): saves the checklist Claude just wrote, named from its h
   expect(saved.items.length).toBe(3)
   expect(saved.name).toBe('Next steps to submit to the App Store')
   expect(String(answer.text)).toContain('Saved "Next steps to submit to the App Store" (3 items)')
+})
+
+// 2026-11-03 (1a): classic.SessionStart's answer is ClassicResultOf['classic.SessionStart'],
+// whose additionalContext is string[] ("one entry per hook"). The test's own hook sits
+// beneath the mod, standing for your settings hooks: its context must stay, first, and the
+// repo's decisions are added after it.
+const DEC_TEXT = 'Decisions already made in this repo (accepted in Leftoff\'s decision log, newest first). Follow them unless the developer changes one:\n- D-7f3a: Use Postgres\nFull log: the Leftoff board'
+function decFetch(posts: any[], answer: any) {
+  return (_$: any, e: any) => {
+    posts.push(e)
+    const url = String(e.url || '')
+    if (url.includes('/v1/decisions/context')) {
+      if (answer === 'down') return { value: { status: 503, ok: false, headers: {}, text: '{}' } }
+      return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(answer) } }
+    }
+    return { value: { status: 200, ok: true, headers: {}, text: '{"ok":true}' } }
+  }
+}
+
+test('SessionStart (1a): the decisions reach Claude as additionalContext, after your own hook\'s context', async ($, on) => {
+  const posts: any[] = []
+  stubBasics(on, posts, { fetch: decFetch(posts, { context: DEC_TEXT, count: 1 }) })
+  on('classic.SessionStart', () => ({ additionalContext: ['your own hook said this'] }))
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/acme' })
+  const r: any = await $.classic.SessionStart({ source: 'startup', session_id: SID, cwd: '/work/acme' } as any)
+  expect(r.additionalContext).toEqual(['your own hook said this', DEC_TEXT])
+  expect(posts.some((p) => String(p.url).includes('/v1/decisions/context'))).toBe(true)
+})
+
+test('SessionStart (1a): nothing is added when the repo has none or the daemon is down; your context is kept as is', async ($, on) => {
+  const posts: any[] = []
+  let answer: any = { context: null }
+  stubBasics(on, posts, { fetch: (x: any, e: any) => decFetch(posts, answer)(x, e) })
+  on('classic.SessionStart', () => ({ additionalContext: ['mine'] }))
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/acme' })
+  let r: any = await $.classic.SessionStart({ source: 'startup', session_id: SID, cwd: '/work/acme' } as any)
+  expect(r.additionalContext).toEqual(['mine'])
+  answer = 'down'
+  r = await $.classic.SessionStart({ source: 'startup', session_id: SID, cwd: '/work/acme' } as any)
+  expect(r.additionalContext).toEqual(['mine'])
+})
+
+test('SessionStart (1a): Leftoff\'s own runs and board-run headless sessions get no decisions', async ($, on) => {
+  const posts: any[] = []
+  stubBasics(on, posts, { env: { LEFTOFF_HEADLESS: 'aaaaaaaa-0000-4000-8000-000000000001' }, fetch: decFetch(posts, { context: DEC_TEXT, count: 1 }) })
+  on('classic.SessionStart', () => ({}))
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/acme' })
+  const r: any = await $.classic.SessionStart({ source: 'startup', session_id: SID, cwd: '/work/acme' } as any)
+  expect(r.additionalContext === undefined || r.additionalContext.length === 0).toBe(true)
+  expect(posts.some((p) => String(p.url).includes('/v1/decisions/context'))).toBe(false)
+})
+
+test('/cp-decisions (1b): the repo\'s decisions as the command\'s context for Claude, and shown to you', async ($, on) => {
+  const posts: any[] = []
+  stubBasics(on, posts, { fetch: decFetch(posts, { context: DEC_TEXT, count: 1, repo: 'gh:acme/web' }) })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/acme' })
+  const r: any = await $.command.run({ command: 'cp-decisions', args: '' })
+  expect(r.context).toEqual([DEC_TEXT])
+  expect(String(r.text)).toContain('D-7f3a: Use Postgres')
+  expect(posts.some((p) => String(p.url).includes('/v1/decisions/context?via=command'))).toBe(true)
 })

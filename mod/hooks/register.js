@@ -14,21 +14,25 @@
 // each event is registered once per matcher.
 import {
   DEFAULT_CONFIG, DEFAULT_PORT, mergeConfig, resolveMachine, applyEvent, checkpointDue, buildCheckpointPrompt,
-  parseCheckpointReply, retryCheckpointPrompt, betterSalvage, heuristicCheckpoint, isEmptyCheckpoint, NOTHING_TO_CHECKPOINT, renderCheckpointMd, checkpointId, checkpointFileName,
+  parseCheckpointReply, retryCheckpointPrompt, mergeDecided, betterSalvage, heuristicCheckpoint, isEmptyCheckpoint, NOTHING_TO_CHECKPOINT, renderCheckpointMd, checkpointId, checkpointFileName,
   sessionFolderName, id8, clip, toIso, resumeCommand, repoName,
   shortId, formatTabTitle, parseTabTitle, tabRenameWaits, detectTerminal, parseProcLine, trailingQuestion,
   parseCheckpointArgs, SUMMARY_LENGTHS, parseBulletList, parseCatchupArgs,
   listHintFrom, backgroundListFrom, extractChecklists, parseTodoArgs, parseDoneArgs, detectBackend, parseParkArgs,
-  boardLinkLines, isNonInteractive, isLeftoffHeadless, lockForPark, parkLockHeld, unlockParkLocks, parkWorktreeText,
+  boardLinkLines, isNonInteractive, isLeftoffHeadless, lockForPark, parkLockHeld, unlockParkLocks, parkWorktreeText, reconcileWithWork,
 } from './core.js'
 
 const PANE_ID = 'checkpoints'
 const POST_TIMEOUT_MS = 800
 const END_TIMEOUT_MS = 1000
 const MODEL_TIMEOUT_MS = 20000
+const STOP_GRACE_MS = 2500 // 2026-11-03 how long a completed turn waits for its Stop before the mod reports the end itself
+const SKIP_GRACE_MS = 4000 // 2026-11-03 how long a mod event waits for its classic twin before that classic event counts as passed over
+const START_SKIP_GRACE_MS = 15000 // the same for SessionStart (a cold start can be slow)
+const PERM_GRACE_MS = 1500 // how long a permission prompt tool.check saw waits for classic.PermissionRequest before the mod reports it
 
 // Module state. $.state is not used: the pane redraws with $.ui.invalidate.
-const MOD_VERSION = '0.9.17' // keep in step with .claude-plugin/plugin.json
+const MOD_VERSION = '0.9.18' // keep in step with .claude-plugin/plugin.json
 
 const st = {
   internal: false,
@@ -69,6 +73,15 @@ const st = {
   listSig: null, // v0.5.1: the signature of this session's lists Claude last heard about
   listPending: false, // a list was saved or ticked here: tell Claude with the next prompt
   paneNeeds: 0, // sessions that need you (the pane's top line)
+  turnStartAt: 0, // 2026-11-03 when this process's current turn started (turn.start)
+  stopAt: 0, // and when a Stop last came (classic.Stop)
+  // 2026-11-03 Claude Code 2.1.31x passes every classic.* event of a plugin you
+  // installed over when its built-in cc-plugin-sec-default is seated first (a
+  // Team or Enterprise plan, or managed settings): see SKIP_GRACE_MS below.
+  classicSeen: false, // a classic.* hook of this mod ran in this process
+  hooksSkipped: null, // the classic events we saw passed over, as last told to the daemon
+  permAt: 0, // when classic.PermissionRequest last ran
+  watchAsks: {}, // tool_use_id -> { tool, at, reported, done }: permission prompts tool.check saw
 }
 
 // Millisecond precision: the daemon dedupes events per (sessionId, type, at).
@@ -230,7 +243,7 @@ async function readRepo($, cwd) {
 
 async function heartbeat($) {
   if (st.internal || !st.sessionId) return
-  const res = await sendOrSpool($, 'heartbeat', { inTurn: !!(st.record && st.record.inTurn) })
+  const res = await sendOrSpool($, 'heartbeat', { inTurn: !!(st.record && st.record.inTurn), ...(st.hooksSkipped && st.hooksSkipped.length ? { hooksSkipped: st.hooksSkipped } : {}) })
   if (res && !st.modHealthSent) await reportModHealth($)
   if (res && st.daemonTitle) await noteTitle($, st.daemonTitle)
   else if (res && st.tabTitle && !(st.record && st.record.inTurn)) await applyTabTitle($, null) // the marker came (it never goes: tabMarkerKept), or a rename that had to wait
@@ -241,6 +254,99 @@ async function heartbeat($) {
     const reason = checkpointDue(st.record, Date.now(), st.cfg)
     if (reason) await makeCheckpoint($, reason, null)
   }
+}
+
+// 2026-11-03 a turn completed and no Stop came for it within STOP_GRACE_MS:
+// report its end (once; nothing when this process doesn't hold a turn open).
+async function stopFallback($, completedAt, reason) {
+  if (st.internal || !st.sessionId) return
+  if (st.stopAt && st.stopAt >= (st.turnStartAt || 0)) return // its Stop came
+  if (!(st.record && st.record.inTurn)) return
+  st.stopAt = Date.now()
+  await sendOrSpool($, 'turn_completed', { endReason: String(reason || 'end').slice(0, 40), settledBy: 'mod', completedAt: new Date(completedAt).toISOString() })
+}
+
+// ---------------------------------------------------------------- passed-over classic hooks (2026-11-03)
+//
+// Claude Code 2.1.31x seats its built-in "cc-plugin-sec-default" outermost on
+// a Team or Enterprise plan or a machine with managed settings, and its hooks
+// module answers every classic.* event with next.to(e, "append"): the event
+// jumps past the user tier, where a plugin you installed (this one) sits, so
+// none of our classic.* hooks run (Claude Code then says "leftoff: its
+// classic.Stop hook was skipped. "cc-plugin-sec-default" runs first and sent
+// the event on past it."). Our other events are untouched: session.start,
+// prompt.submit, turn.start, turn.complete, tool.check and tool.call.
+// So: each of those notes the classic event that should come with it; when it
+// doesn't come within the grace and no classic hook has run in this process at
+// all, the classic event counts as passed over and the daemon hears which.
+function sawClassic($, name) {
+  if (name === 'PermissionRequest') st.permAt = Date.now()
+  if (st.classicSeen) return
+  st.classicSeen = true
+  if (st.hooksSkipped && st.hooksSkipped.length) { // a slow SessionStart we counted out too early, a setting changed: they run
+    st.hooksSkipped = []
+    sendOrSpool($, 'heartbeat', { hooksSkipped: [], fromMod: true }).catch(() => {})
+  }
+}
+
+function expectClassic($, name, graceMs) {
+  if (st.classicSeen || st.internal) return
+  $.clock.after(graceMs || SKIP_GRACE_MS, () => { noteSkipped($, name).catch(() => {}) })
+}
+
+async function noteSkipped($, name) {
+  if (st.classicSeen || st.internal || !st.sessionId) return
+  const cur = st.hooksSkipped || []
+  if (cur.includes(name)) return
+  st.hooksSkipped = cur.concat(name)
+  await sendOrSpool($, 'heartbeat', { hooksSkipped: st.hooksSkipped, fromMod: true })
+}
+
+// A permission prompt, seen from tool.check: next(e) is the whole check
+// (rules, modes, other plugins' hooks, Claude Code's own), and { decision: "ask" }
+// with approver "person" is the terminal's permission dialog (a host such as
+// headless answers "host"; no approver means it is never asked). We only
+// look: the answer goes back as it came. Reported as Claude Code's own
+// permission_prompt notification would be, unless classic.PermissionRequest
+// ran for it (then permissionHook has put it on the board, answerable there).
+function watchAsk($, e) {
+  if (st.internal || st.headless || !st.sessionId) return
+  const at = Date.now()
+  const id = String(e.tool_use_id || (String(e.tool || '') + '@' + at))
+  st.watchAsks[id] = { tool: e.tool, at, reported: false, done: false }
+  expectClassic($, 'PermissionRequest')
+  $.clock.after(PERM_GRACE_MS, () => { reportAsk($, id, e).catch(() => {}) })
+}
+
+async function reportAsk($, id, e) {
+  const w = st.watchAsks[id]
+  if (!w || w.done) return
+  if (st.permAt >= w.at) { delete st.watchAsks[id]; return } // its PermissionRequest hook ran: the board has it
+  w.reported = true
+  await sendOrSpool($, 'notification', {
+    notificationType: 'permission_prompt', message: clip(askMessage(e.tool), 200), tool: e.tool || null, fromMod: true,
+    ...(st.hooksSkipped && st.hooksSkipped.length ? { hooksSkipped: st.hooksSkipped } : {}),
+  })
+}
+
+function askMessage(tool) {
+  if (tool === 'AskUserQuestion') return 'Claude has a question for you'
+  return 'Claude needs your permission to use ' + (tool || 'a tool')
+}
+
+// The prompt went away: the tool runs (tool.call) or the turn is over. Says so
+// only for prompts the mod reported (an activity the board reads as a tool
+// that ran, which ends "Needs you" for a permission prompt).
+async function settleAsks($, toolUseId, tool) {
+  let reported = false
+  for (const id of Object.keys(st.watchAsks)) {
+    const w = st.watchAsks[id]
+    if (toolUseId !== undefined && (toolUseId ? id !== String(toolUseId) : w.tool !== tool)) continue
+    w.done = true
+    if (w.reported) reported = true
+    delete st.watchAsks[id]
+  }
+  if (reported) await sendOrSpool($, 'activity', { kind: 'tool', phase: 'post', tool: tool || null, fromMod: true })
 }
 
 // The commands, in the order they're tried. Claude Code 2.1.295's built-ins
@@ -259,6 +365,8 @@ const COMMANDS = [
   { key: 'todo', names: ['cp-todo', 'leftoff-todo'], description: 'Leftoff: save the checklist Claude just wrote as a list you can tick off (board, phone, or here)', argumentHint: '[name] [--pick [N]]', immediate: true },
   // v0.8.2: checkpoint, mark the session Parked (not Closed when it exits), then close it.
   { key: 'park', names: ['cp-park', 'leftoff-park'], description: 'Leftoff: checkpoint and park this session to come back to (your note becomes the Next line), then exit', argumentHint: '[note]', immediate: false },
+  // 2026-11-03 (1b): the repo's accepted decisions into the conversation on demand (when SessionStart was skipped, or after /clear).
+  { key: 'decisions', names: ['cp-decisions', 'leftoff-decisions'], description: 'Leftoff: give Claude this repo\'s accepted decisions (the same list a new session starts with)', immediate: false },
   { key: 'done', names: ['cp-done', 'leftoff-done'], description: 'Leftoff: tick items on this session\'s list (/cp-done 3, /cp-done 2 4, /cp-done undo 3)', argumentHint: '<n…> [in <list>]', immediate: true },
 ]
 
@@ -369,6 +477,37 @@ async function unlockOwnParkLocks($, cwd) {
   try {
     await unlockParkLocks((argv) => gitFor($, argv), cwd, st.sessionId)
   } catch {}
+}
+
+// ------------------------------------------------------------ decisions (2026-11-03)
+
+// The daemon's short read of this repo's accepted decisions (id + one line each, capped), or null:
+// nothing for Leftoff's own runs or a board-run headless session, when the daemon doesn't answer quickly,
+// or when the repo has none.
+const DECISIONS_TIMEOUT_MS = 800
+async function decisionContext($, e) {
+  if (st.internal || await isHeadless($)) return null
+  const q = '?session=' + encodeURIComponent(e.session_id || st.sessionId || '') + (e.cwd ? '&cwd=' + encodeURIComponent(e.cwd) : '')
+  const r = await api($, 'GET', '/v1/decisions/context' + q, undefined, DECISIONS_TIMEOUT_MS)
+  const t = r && r.ok && r.json && typeof r.json.context === 'string' ? r.json.context.trim() : ''
+  return t ? t.slice(0, 2000) : null
+}
+
+// 1b /cp-decisions: the same text SessionStart adds (src/decisions.js decisionContextText, from the daemon),
+// shown to you and handed to Claude as the command's context. The daemon notes that this session was given them.
+// Runs where the classic hooks are skipped: a command is not a classic event (Claude Code's Security default
+// hooks classic.* but not command.run; checked on 2.1.317 and 2.1.318).
+async function decisionsCommand($) {
+  if (st.internal) return { text: 'Leftoff: not in Leftoff\'s own runs.' }
+  let cwd = null
+  try { cwd = await $.session.cwd() } catch {}
+  const sid = st.sessionId || ''
+  const r = await api($, 'GET', '/v1/decisions/context?via=command&session=' + encodeURIComponent(sid) + (cwd ? '&cwd=' + encodeURIComponent(cwd) : ''), undefined, 2000)
+  if (!r || !r.ok || !r.json) return { text: 'Leftoff: the daemon didn\'t answer, so this repo\'s decisions couldn\'t be read (leftoff status).' }
+  const t = typeof r.json.context === 'string' ? r.json.context.trim().slice(0, 2000) : ''
+  if (!t) return { text: r.json.repo ? 'Leftoff: this repo has no accepted decisions yet. Review proposed ones on the board.' : 'Leftoff: this folder isn\'t a repo Leftoff keeps a decision log for.' }
+  const n = Number(r.json.count) || t.split('\n').filter((l) => l.startsWith('- ')).length
+  return { text: 'Leftoff: gave Claude this repo\'s ' + n + ' accepted decision' + (n === 1 ? '' : 's') + ':\n' + t, context: [t] }
 }
 
 // ------------------------------------------------------------ lists (v0.5.1)
@@ -727,6 +866,11 @@ async function makeCheckpoint($, trigger, userNote, length, opts = {}) {
     }
     // 0.9.2: nothing to go on (no prompt, no reply): don't save a placeholder over the last real one
     if (isEmptyCheckpoint(parsed)) { if (trigger === 'manual') $.ui.toast(NOTHING_TO_CHECKPOINT, { timeoutMs: 6000 }); return null }
+    // 2026-11-06: a Stopped at / Next that calls a PR this session merged "ready to merge": the facts win
+    if (parsed.format !== 'markdown') {
+      const fix = reconcileWithWork(parsed, ctx.work)
+      if (fix.corrected.length) { parsed = { ...parsed, stoppedAt: fix.stoppedAt, next: fix.next }; generator = { ...(generator || {}), corrected: fix.corrected.join(' ') } }
+    }
     if (opts.next) parsed = { ...parsed, next: opts.next }
     const cp = {
       sessionId: st.sessionId, createdAt: nowIso(), trigger, machine: st.machine,
@@ -735,6 +879,8 @@ async function makeCheckpoint($, trigger, userNote, length, opts = {}) {
       doing: parsed.doing, stoppedAt: parsed.stoppedAt, next: parsed.next, openQuestion: parsed.openQuestion || null,
       userNote: userNote || null, filesTouched: ctx.filesTouched, turnsSinceLast: record.turnsSinceCheckpoint || 0,
       parseOk: parsed.parseOk, ...(parsed.format === 'markdown' ? { format: 'markdown' } : {}), generator, length: ctx.length,
+      work: ctx.work || [], // 2026-11-06: what the commands' output shows got done
+      decided: mergeDecided(ctx.found, generator && generator.by === 'heuristic' ? [] : parsed.decided, { earlier: st.lastCheckpoint && st.lastCheckpoint.decided }), // 2026-11-03 decision memory
       decisions: parsed.decisions || [], questions: parsed.questions || [], files: parsed.files || [],
       didntWork: parsed.didntWork || [], recap: parsed.recap || '', nextSteps: parsed.nextSteps || [],
     }
@@ -967,14 +1113,22 @@ function startReplyLoop($) {
     let backoff = 0
     while (st.replyLoop && st.sessionId) {
       const sid = st.sessionId
-      const r = await api($, 'GET', '/v1/sessions/' + encodeURIComponent(sid) + '/replies/next?ms=' + ASK_POLL_MS, undefined, ASK_POLL_MS + 5000)
+      const r = await api($, 'GET', '/v1/sessions/' + encodeURIComponent(sid) + '/replies/next?cmds=1&ms=' + ASK_POLL_MS, undefined, ASK_POLL_MS + 5000)
       if (!r || !r.ok) {
         // Daemon down: try again on the heartbeat rather than spinning.
         st.replyLoop = false
         return
       }
       const reply = r.json && r.json.reply
-      if (reply && reply.text && !String(reply.text).startsWith('/') && sid === st.sessionId) {
+      // a slash command from the board (the daemon checked it against its list):
+      // Claude Code runs it as if typed, queued behind a running turn (as /rename)
+      if (reply && reply.command && typeof reply.command.name === 'string' && /^[a-z][\w-]{0,30}$/.test(reply.command.name) && sid === st.sessionId) {
+        try {
+          await $.command.run({ command: reply.command.name, args: String(reply.command.args || '').replace(/[\r\n]+/g, ' ').slice(0, 500) })
+        } catch (err) {
+          try { $.ui.toast('Leftoff: couldn’t run the board’s /' + reply.command.name + ': ' + String((err && err.message) || err).slice(0, 120)) } catch {}
+        }
+      } else if (reply && reply.text && !String(reply.text).startsWith('/') && sid === st.sessionId) {
         try {
           await $.prompt.submit({ text: String(reply.text) })
         } catch (err) {
@@ -1029,6 +1183,7 @@ export function register(on, options) {
       st.heartbeat = $.clock.every(60000, () => { heartbeat($).catch(() => {}); startReplyLoop($) })
       st.ready = true
       startReplyLoop($)
+      expectClassic($, 'SessionStart', START_SKIP_GRACE_MS) // 2026-11-03 passed over? (sawClassic)
     } catch {}
     // Commands last, each on its own: a taken name throws, so a
     // clash costs only that command, and registerCommands reports it.
@@ -1037,6 +1192,7 @@ export function register(on, options) {
   })
 
   on('classic.SessionStart', async ($, e, next) => {
+    sawClassic($, 'SessionStart')
     if (!(await internalOnce($)) && !st.internal && e.session_id) {
       let parentSessionId
       if (st.sessionId && e.session_id !== st.sessionId) {
@@ -1064,11 +1220,20 @@ export function register(on, options) {
         const name = own && !own.id ? own.name : (own && own.name) || st.daemonTitle || null
         await applyTabTitle($, name, { force: !!parentSessionId, current: e.session_title || null })
       }
+      // 2026-11-03 decision memory: the repo's accepted decisions go to Claude as this event's context.
+      // Added to what the hooks below (yours included) answer, never in place of it.
+      const ctx = await decisionContext($, e)
+      if (ctx) {
+        const res = await next(e)
+        const r = res && typeof res === 'object' ? res : {}
+        return { ...r, additionalContext: [...(Array.isArray(r.additionalContext) ? r.additionalContext : []), ctx] }
+      }
     }
     return next(e)
   })
 
   on('classic.UserPromptSubmit', async ($, e, next) => {
+    sawClassic($, 'UserPromptSubmit')
     await sendOrSpool($, 'activity', { kind: 'prompt', prompt: clip(e.prompt || '', 300), sessionTitle: e.session_title && e.session_title === st.tabTitle ? null : e.session_title, ...moved(e) }) // our own /rename isn't a name you chose
     return next(e)
   })
@@ -1078,11 +1243,13 @@ export function register(on, options) {
   // context entry: the list, its numbers, and `leftoff todo done <list> <n>`.
   // Context goes on the event before next(); on the result it would be too late.
   on('prompt.submit', async ($, e, next) => {
+    expectClassic($, 'UserPromptSubmit')
     const ctx = await listContextFor($)
     return next(ctx ? { ...e, context: [...(Array.isArray(e.context) ? e.context : []), ctx] } : e)
   })
 
   on('turn.start', async ($, e, next) => {
+    st.turnStartAt = Date.now()
     await sendOrSpool($, 'turn_started', {})
     return next(e)
   })
@@ -1090,11 +1257,21 @@ export function register(on, options) {
   on('turn.complete', async ($, e, next) => {
     // classic.Stop reports a normal end with its details; Stop doesn't fire for
     // an interrupted or failed turn, so those are reported here.
+    await settleAsks($, undefined).catch(() => {}) // 2026-11-03 a permission prompt the mod reported is over with the turn
     if (e.reason === 'aborted' || e.reason === 'error' || e.reason === 'refusal') await sendOrSpool($, 'turn_completed', { endReason: e.reason })
+    // 2026-11-03 Claude Code doesn't run every Stop for every end of a turn
+    // (2.1.317: a turn its loop ends runs Stop without the in-process hooks,
+    // and a tool can end a turn), and then this turn stayed open on the board
+    // for good. If no Stop came for this turn shortly after it completed, the
+    // end is reported from here; a Stop that comes later is the same turn
+    // (the daemon doesn't count it twice).
+    else { const at = Date.now(); $.clock.after(STOP_GRACE_MS, () => { stopFallback($, at, e.reason).catch(() => {}) }); expectClassic($, 'Stop') }
     return next(e)
   })
 
   on('classic.Stop', async ($, e, next) => {
+    sawClassic($, 'Stop')
+    st.stopAt = Date.now()
     // v0.5.1: a checklist of 3+ in this reply (a cheap regex, no model) -> the
     // board's card offers "Claude wrote a 7-step list · Save". Nothing is saved here.
     const listHint = listHintFrom(e.last_assistant_message || '', { fallback: st.daemonTitle || null })
@@ -1118,20 +1295,36 @@ export function register(on, options) {
   })
 
   on('classic.Notification', async ($, e, next) => {
+    sawClassic($, 'Notification')
     await sendOrSpool($, 'notification', { notificationType: e.notification_type || null, message: clip(e.message || '', 200), ...moved(e) })
     return next(e)
   })
 
-  on('classic.PermissionRequest', permissionHook)
+  on('classic.PermissionRequest', async ($, e, next) => { sawClassic($, 'PermissionRequest'); return permissionHook($, e, next) })
+
+  // 2026-11-03 a permission prompt, seen whether or not classic.PermissionRequest
+  // reaches us (see watchAsk): we only look, and hand the answer back as it came.
+  on('tool.check', async ($, e, next) => {
+    const r = await next(e)
+    try { if (r && r.decision === 'ask' && e && e.approver === 'person') watchAsk($, e) } catch {}
+    return r
+  })
+
+  // The tool runs: a prompt the mod reported for it was answered in the terminal.
+  on('tool.call', async ($, e, next) => {
+    if (e && Object.keys(st.watchAsks).length) await settleAsks($, e.tool_use_id || null, e.tool).catch(() => {})
+    return next(e)
+  })
 
   on('classic.PostToolUse', async ($, e, next) => {
+    sawClassic($, 'PostToolUse')
     await toolRan($, e)
     const m = moved(e) // EnterWorktree, or a cd: say so now, not at the end of the turn
     if (m.cwd || m.transcriptPath) await sendOrSpool($, 'activity', { kind: 'cwd', ...m })
     return next(e)
   })
 
-  on('classic.PostToolUseFailure', async ($, e, next) => { await toolRan($, e); return next(e) })
+  on('classic.PostToolUseFailure', async ($, e, next) => { sawClassic($, 'PostToolUseFailure'); await toolRan($, e); return next(e) })
 
   on('session.end', async ($, e, next) => {
     // About 1.5 s shared by every SessionEnd hook: post and go. The daemon makes
@@ -1160,6 +1353,8 @@ export function register(on, options) {
   on('command.run', { command: 'leftoff-park' }, async ($, e) => parkCommand($, e.args))
 
   on('command.run', { command: 'checkpoints' }, async ($, e) => paneCommand($, e.args))
+  on('command.run', { command: 'cp-decisions' }, async ($) => decisionsCommand($))
+  on('command.run', { command: 'leftoff-decisions' }, async ($) => decisionsCommand($))
 
   on('ui.render', { component: 'Pane' }, async ($, e, next) => {
     if (e.requestId !== PANE_ID) return next(e)
