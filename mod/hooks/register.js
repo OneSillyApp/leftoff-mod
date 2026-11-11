@@ -32,7 +32,7 @@ const START_SKIP_GRACE_MS = 15000 // the same for SessionStart (a cold start can
 const PERM_GRACE_MS = 1500 // how long a permission prompt tool.check saw waits for classic.PermissionRequest before the mod reports it
 
 // Module state. $.state is not used: the pane redraws with $.ui.invalidate.
-const MOD_VERSION = '0.9.18' // keep in step with .claude-plugin/plugin.json
+const MOD_VERSION = '0.9.19-beta.14' // keep in step with .claude-plugin/plugin.json
 
 const st = {
   internal: false,
@@ -712,6 +712,10 @@ async function readTermEnv($) {
     put('TMUX', await $.env.get('TMUX'))
     put('TMUX_PANE', await $.env.get('TMUX_PANE'))
     put('TERM_SESSION_ID', await $.env.get('TERM_SESSION_ID'))
+    put('REX_SESSION', await $.env.get('REX_SESSION')) // 2026-11-09 Rex: its session, block, server and CLI folder
+    put('REX_BLOCK', await $.env.get('REX_BLOCK'))
+    put('REX_SERVER', await $.env.get('REX_SERVER'))
+    put('REX_BIN_DIR', await $.env.get('REX_BIN_DIR'))
     st.titleOff = !!(await $.env.get('CLAUDE_CODE_DISABLE_TERMINAL_TITLE'))
   } catch {}
   return env

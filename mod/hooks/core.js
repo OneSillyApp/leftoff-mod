@@ -33,6 +33,7 @@ export const DEFAULT_CONFIG = {
 }
 
 export const STATUSES = ['active', 'waiting', 'background', 'needs_input', 'dormant', 'ended', 'stale']
+export const BACKGROUND_MAX_IDLE_MS = 24 * 60 * 60 * 1000 // 2026-11-10: "tasks running" is believed for a day without any activity
 export const TRIGGERS = ['dormant', 'manual', 'session_end', 'clear', 'long_run', 'park']
 export const EVENT_TYPES = [
   'session.opened', 'session.started', 'activity', 'turn_started', 'turn_completed',
@@ -821,14 +822,35 @@ export function formatTabTitle(format, { name, id, repo, marker = false } = {}) 
 export const TERM_ENV_KEYS = [
   'TERM_PROGRAM', 'TERM_PROGRAM_VERSION', 'TERM', 'GHOSTTY_RESOURCES_DIR', 'ITERM_SESSION_ID',
   'WEZTERM_PANE', 'WEZTERM_UNIX_SOCKET', 'KITTY_WINDOW_ID', 'KITTY_LISTEN_ON', 'TMUX', 'TMUX_PANE', 'TERM_SESSION_ID',
+  'REX_SESSION', 'REX_BLOCK', 'REX_SERVER', 'REX_BIN_DIR', // 2026-11-09 Rex (src/rex.js)
 ]
 
-const LABELS = { ghostty: 'Ghostty', iterm2: 'iTerm2', wezterm: 'WezTerm', kitty: 'kitty', 'apple-terminal': 'Terminal.app', tmux: 'tmux', vscode: 'VS Code', unknown: 'unknown terminal' }
+// 2026-11-09 Rex sets REX_SESSION, REX_BLOCK and REX_SERVER in every terminal, and
+// REX_BIN_DIR (the folder of its own `rex`): https://www.superlogical.com/rex/docs/automate/cli.md
+// -> { rexSession, rexBlock, rexServer?, rexBinDir? } or null (not a Rex terminal).
+const REX_ID = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$/
+export const rexIdOk = (v) => typeof v === 'string' && REX_ID.test(v)
+export function rexIds(env = {}) {
+  const e = env || {}
+  const session = e.REX_SESSION ? String(e.REX_SESSION) : ''
+  const block = e.REX_BLOCK ? String(e.REX_BLOCK) : ''
+  if (!rexIdOk(session) || !rexIdOk(block)) return null
+  const out = { rexSession: session, rexBlock: block }
+  const plain = (v) => v && String(v).length < 512 && !/[\x00-\x1f]/.test(String(v))
+  if (plain(e.REX_SERVER)) out.rexServer = String(e.REX_SERVER)
+  if (plain(e.REX_BIN_DIR) && String(e.REX_BIN_DIR).startsWith('/')) out.rexBinDir = String(e.REX_BIN_DIR)
+  return out
+}
+
+const LABELS = { rex: 'Rex', ghostty: 'Ghostty', iterm2: 'iTerm2', wezterm: 'WezTerm', kitty: 'kitty', 'apple-terminal': 'Terminal.app', tmux: 'tmux', vscode: 'VS Code', unknown: 'unknown terminal' }
 
 function outerTerminal(env) {
   const tp = String(env.TERM_PROGRAM || '')
   const term = String(env.TERM || '')
   const t = tp.toLowerCase()
+  // 2026-11-09 Rex first: its terminals start with the server's environment, which can
+  // carry the TERM_PROGRAM of the terminal that started it (a Linux server, say).
+  if (rexIds(env) || t === 'rex') return 'rex' // Rex also sets TERM_PROGRAM=rex (seen on a Mac, Nov 9)
   if (t === 'ghostty') return 'ghostty'
   if (t === 'iterm.app') return 'iterm2'
   if (t === 'wezterm') return 'wezterm'
@@ -862,6 +884,7 @@ export function detectTerminal(env = {}) {
     return { ...out, ...ids }
   }
   out.kind = outer
+  if (outer === 'rex') Object.assign(out, rexIds(e) || {}) // its session and block, for Interrupt and Go
   out.label = outer === 'unknown' ? (e.TERM_PROGRAM || e.TERM || 'unknown terminal') : LABELS[outer]
   // Where Ghostty.app lives, so Go can read its dictionary (does it have tty?) from the bundle.
   if (outer === 'ghostty' && e.GHOSTTY_RESOURCES_DIR) out.resourcesDir = String(e.GHOSTTY_RESOURCES_DIR)
@@ -910,7 +933,7 @@ export function computeStatus(s, now, cfg = DEFAULT_CONFIG) {
     const pidFresh = !isNaN(seen) && now - seen <= Math.max(cfg.staleAfterSec * 1000, 90000)
     if (!pidFresh && !isNaN(hb) && now - hb > cfg.staleAfterSec * 1000) return 'stale'
   }
-  if (s.needsInput) return 'needs_input'
+  if (s.needsInput || s.termPrompt) return 'needs_input' // 2026-11-08: or a prompt only the terminal shows (the daemon reads it from the transcript)
   if (s.inTurn) {
     // Hooks-only capture sees no event when a turn is interrupted (Stop does not
     // fire), so a turn that has been silent for twice the dormancy window is
@@ -920,7 +943,11 @@ export function computeStatus(s, now, cfg = DEFAULT_CONFIG) {
     if ((s.capture === 'hooks' || s.capture === 'codex') && idle >= 2 * dormantAfter && !(s.subagents && s.subagents.n > 0)) return 'dormant'
     return 'active'
   }
-  if (s.backgroundTasks > 0 || (s.subagents && s.subagents.n > 0)) return 'background' // 2026-11-06: subagents working (the daemon reads them, src/subagents.js), a turn's end missed or not
+  // 2026-11-10: a background-task count nothing has touched for a day is left over (the task's end was never
+  // seen: the terminal closed, the Mac restarted), not a task still running: a session idle 31 days read
+  // "1 task running" with a spinner. Subagents are read live by the daemon, so they still count.
+  const bgLive = s.backgroundTasks > 0 && idle < BACKGROUND_MAX_IDLE_MS
+  if (bgLive || (s.subagents && s.subagents.n > 0)) return 'background' // 2026-11-06: subagents working (the daemon reads them, src/subagents.js), a turn's end missed or not
   return idle >= dormantAfter ? 'dormant' : 'waiting'
 }
 
@@ -1036,11 +1063,12 @@ export function applyEvent(s, ev) {
       if (d.kind === 'name') break // 0.8.6: a title heard by the status line is not activity
       activity()
       if (d.kind === 'tool' && d.phase === 'post' && s.needsInput && (s.lastNotification === 'permission_prompt' || s.capture === 'codex')) { s.needsInput = false; if (s.capture === 'codex') s.lastNotification = null }
+      if (d.kind === 'prompt' || (d.kind === 'tool' && d.phase === 'post' && (d.tool === 'ExitPlanMode' || d.tool === 'AskUserQuestion'))) s.termPrompt = null // 2026-11-08: a prompt only the terminal showed was answered (or left)
       if (d.kind === 'prompt') {
         s.needsInput = false
         s.question = null
         s.lastNotification = null
-        if (d.prompt && (!s.firstPrompt || /^\s*<channel\b/.test(s.firstPrompt))) s.firstPrompt = clip(stripChannel(d.prompt), 300) || s.firstPrompt || null // 0.9.8: a Live link message, without its wrapper (even one the 300-character clip cut short)
+        if (d.prompt && (!s.firstPrompt || /^\s*<channel\b/.test(s.firstPrompt) || isInjectedText(s.firstPrompt))) s.firstPrompt = clip(stripInjected(d.prompt), 300) || (isInjectedText(s.firstPrompt) ? null : s.firstPrompt) || null // 0.9.8: a Live link message, without its wrapper (even one the 300-character clip cut short); 2026-11-08: never a <task-notification> or another of Claude Code's own injections
         if (d.countTurn === true) s.turns = (s.turns || 0) + 1 // 0.8.1: Codex counts a turn at its prompt when no task_started came first
         if (s.capture === 'hooks') { s.inTurn = true; s.activeSince = s.activeSince || at }
       }
@@ -1056,6 +1084,7 @@ export function applyEvent(s, ev) {
     case 'turn_completed':
       activity()
       s.inTurn = false
+      s.termPrompt = null
       s.activeSince = null
       s.needsInput = false
       if (d.countTurn !== false && !d.again) s.turns = (s.turns || 0) + 1 // false: Codex already counted it at the start
@@ -1084,6 +1113,7 @@ export function applyEvent(s, ev) {
       break
     case 'session.ended':
       s.endedAt = at
+      s.termPrompt = null
       s.endReason = d.reason || 'other'
       s.inTurn = false
       break
@@ -2035,6 +2065,31 @@ export function stripChannel(s) {
   t = t.replace(/<channel\b[^>]*>/g, '').replace(/<\/channel\s*>/g, '').replace(/<\/?channel\b[^>]*$/, '')
   return t.trim()
 }
+// 2026-11-08 Claude Code's own injected turns (a background task's
+// <task-notification>, a <system-reminder>, a slash command's <command-name> and
+// <local-command-stdout>…) are not what you asked for: they never name a session.
+// stripInjected takes such blocks off the front (closed or cut short) and gives
+// back what is left, '' when nothing of yours is. ui/cp-text.js keeps a copy (the
+// mod ships on its own); test/unit/title-injected.test.mjs holds the two equal.
+export const INJECTED_TAGS = ['task-notification', 'system-reminder', 'local-command-stdout', 'local-command-stderr', 'local-command-caveat', 'command-name', 'command-message', 'command-args', 'bash-input', 'bash-stdout', 'bash-stderr', 'user-prompt-submit-hook', 'user-memory-input', 'environment_context', 'user_instructions', 'pasted_content']
+const INJ_LEAD = new RegExp('^\\s*<(' + INJECTED_TAGS.join('|') + ')\\b[^>]*>[\\s\\S]*?(?:<\\/\\1\\s*>|$)')
+const INJ_LINE = /^\s*(?:Caveat: The messages below were generated by the user while running local commands|\[Request interrupted by user[^\]]*\])[^\n]*/
+export function stripInjected(s) {
+  let t = stripChannel(s)
+  for (let i = 0; i < 12; i++) {
+    const n = t.replace(INJ_LEAD, '').replace(INJ_LINE, '')
+    if (n === t) break
+    t = n.replace(/^\s+/, '')
+  }
+  return t.replace(/<system-reminder>[\s\S]*?(?:<\/system-reminder>|$)/g, '').trim()
+}
+// Text that is only an injection (something was there, nothing of yours is left).
+export const isInjectedText = (s) => !!String(s == null ? '' : s).trim() && !stripInjected(s)
+// A stored title that is a raw tag ("<task-notification> <task-id>…", "repo@main · <system-reminder>…",
+// a <channel …> wrapper): never a name.
+const BAD_TITLE = new RegExp('^\\s*(?:[\\w.~-]+@[\\w./~+-]+\\s*(?:·|•|\\||—|–|:|-)\\s+)?(?:\\[Request interrupted|Caveat: The messages below|<\\/?(?:channel|' + INJECTED_TAGS.join('|') + ')\\b)')
+export const badTitle = (t) => BAD_TITLE.test(String(t == null ? '' : t))
+
 // 0.9.9: a reply's list kept readable in one line: "…two things: - A. - B." →
 // "…two things: a; b." (a copy of ui/cp-text.js joinListText; a test holds them equal).
 const LIST_LEAD = /^(?:A|An|The|Added|Removed|Changed|Fixed|Updated|Moved|Renamed|Created|Deleted|Wrote|Made|Kept|Put|Ran|Used)\b/
@@ -2087,7 +2142,7 @@ export function heuristicCheckpoint(messages, session = {}, { length = 'short', 
   }
   const firstSentence = (t) => { const s = clip(joinListLines(String(t || '').slice(0, 1200)), 400); const m = s.match(/^(.{20,240}?[.!?])(\s|$)/); return m ? m[1] : clip(s, 240) }
   const firstLine = (t) => String(t || '').split('\n').map((x) => x.trim()).find(Boolean) || ''
-  const first = session.firstPrompt ? stripChannel(session.firstPrompt) : ''
+  const first = session.firstPrompt ? stripInjected(session.firstPrompt) : ''
   const doing = lastUser ? 'Working on: “' + clip(firstLine(lastUser.text), 140) + '”' : (first ? 'Working on: “' + clip(first, 140) + '”' : 'No prompt captured yet.')
   const stoppedAt = lastError ? 'Last error: ' + clip(lastError, 200) : lastAssistant ? firstSentence(lastAssistant.text) : (session.lastPreview ? firstSentence(session.lastPreview) : 'No reply captured yet.')
   // edited files with no `git commit` after the last edit
@@ -2140,7 +2195,7 @@ export function heuristicCheckpoint(messages, session = {}, { length = 'short', 
 
 // Fallback title: {repo}@{branch} · {first 6 words of the first prompt}
 export function fallbackTitle(session) {
-  const words = String(session.firstPrompt || '').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean).slice(0, 6).join(' ')
+  const words = stripInjected(session.firstPrompt || '').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean).slice(0, 6).join(' ')
   const branch = session.repo && session.repo.branch
   return repoName(session) + (branch ? '@' + branch : '') + (words ? ' · ' + words : '')
 }
@@ -2152,7 +2207,7 @@ export const TITLE_LANGUAGE = 'Write it in the same language as the user\'s own 
 export const TITLE_SYSTEM = 'Write a title of at most 6 words for a coding session, based on its first prompt. ' + TITLE_LANGUAGE + ' Reply with the title only, no quotes, no punctuation at the end.'
 
 export function cleanTitle(text) {
-  const t = stripChannel(String(text || '').replace(/<think>[\s\S]*?<\/think>/gi, '')).split('\n').map((l) => l.trim()).find(Boolean) || '' // 0.9.18: a model that echoes the Live wrapper
+  const t = stripInjected(String(text || '').replace(/<think>[\s\S]*?<\/think>/gi, '')).split('\n').map((l) => l.trim()).find(Boolean) || '' // 0.9.18: a model that echoes the Live wrapper
   return clip(t.replace(/^title\s*:\s*/i, '').replace(/^["'`*]+|["'`*.]+$/g, ''), 60)
 }
 
