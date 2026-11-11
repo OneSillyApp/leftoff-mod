@@ -32,7 +32,7 @@ const START_SKIP_GRACE_MS = 15000 // the same for SessionStart (a cold start can
 const PERM_GRACE_MS = 1500 // how long a permission prompt tool.check saw waits for classic.PermissionRequest before the mod reports it
 
 // Module state. $.state is not used: the pane redraws with $.ui.invalidate.
-const MOD_VERSION = '0.9.19-beta.14' // keep in step with .claude-plugin/plugin.json
+const MOD_VERSION = '0.9.19' // keep in step with .claude-plugin/plugin.json
 
 const st = {
   internal: false,
